@@ -1,0 +1,53 @@
+[project]
+version = "0.1.0"
+name = "glmv_reward"
+description = "A reward system for VLM"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "editdistance~=0.8.1",
+  "msgspec~=0.19.0",
+  "numpy~=2.2",
+  "openai~=1.95",
+  "pillow~=11.3",
+  "requests~=2.32",
+  "ruamel-yaml~=0.18.14",
+  "sympy~=1.14",
+]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[dependency-groups]
+dev = [
+  "mypy~=1.16",
+  "poethepoet~=0.36.0",
+  "ruff~=0.12.2",
+  "types-editdistance~=0.8.0",
+  "types-requests~=2.32",
+]
+
+
+[tool.mypy]
+strict = true
+implicit_reexport = true
+warn_return_any = false
+disallow_any_generics = false
+disallow_untyped_calls = false
+
+
+[[tool.mypy.overrides]]
+module = ["ruamel", "sympy"]
+follow_untyped_imports = true
+
+# * uses `poe` to run lint, typecheck tasks
+# * see: https://github.com/astral-sh/uv/issues/5903
+[tool.poe.tasks.lint]
+cmd = "ruff check src/glmv_reward examples/reward_system_demo.py"
+
+
+[tool.poe.tasks.typecheck]
+cmd = "mypy src/glmv_reward examples/reward_system_demo.py"

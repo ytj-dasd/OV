@@ -1,0 +1,2319 @@
+reward_log_dir: "logs/reward_judge"
+
+datasource_reward_config_mapping:
+  default: "general_verifier_config"
+  general: "general_verifier_config"
+  math: "math_verifier_config"
+  chemistry: "chemistry_verifier_config"
+  physics: "physics_verifier_config"
+  chart: "chart_verifier_config"
+  mmsi: "mmsi_verifier_config"
+  multi_image: "multi_image_general_verifier_config"
+  ocr: "ocr_verifier_config"
+  ocr_ignore_case: "ocr_ignore_case_verifier_config"
+  vqa: "vqa_verifier_config"
+  counting: "counting_verifier_config"
+  language_mix: "language_mix_verifier_config"
+  geoguess: "geoquesteoquest_verifier_config"
+
+  # agent
+  AndroidWorld: "androidworld_verifier_config"
+  WebVoyager: "webvoyager_verifier_config"
+  OSWorld: "osworld_verifier_config"
+
+reward_configs:
+    geoquesteoquest_verifier_config:
+        verifier_type: "geoquest"
+        strict_boxed_extraction: true
+        llm_api_key:
+          - "your_api_keys"
+        llm_judge_url:
+          - "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model:
+          - glm-4-flash
+        llm_max_tokens: 4096
+        llm_temperature: 0.8
+        llm_top_p: 0.6
+        model_type: "100b"
+        reasoning: true
+        llm_judge_prompt_template: |
+            请判断模型对图片的分析结论是否正确，并根据规则给出0~1之间的评分。
+            模型的目标是根据用户给出的图片推理出图片拍摄的地点。请仔细分析模型给出的结论是否与地点名称和地址相符。注意，有时地点名称会使用不同的语言给出，请你进行适当翻译以对齐语言。如果模型给出的回答与答案完全相符，获得满分1.0分，如果模型的回答与答案完全不符合，获得0.0分。
+            注意：模型分析结论中的地点名称必须准确，模糊、不准确的答案是错误的，回答的粒度过大，或者模糊不清的，视为错误答案。
+            注意：在analysis字段用不超过30个字简略输出你的分析过程。
+            判分规则：
+            你需要从两方面进行评分：
+            1）地点地址描述：
+                - 地点地址描述部分满分为0.5分
+                - 正确描述到国家一级，可以获得0.1分
+                - 正确描述到省级/州级/当地的一级行政区，可以获得0.25分
+                - 正确描述到城市一级，可以获得0.5分
+            2）地点名称：
+                - 地点名称部分满分为0.5分
+                - 仅能描述出照片氛围、大概的地点分类（如仅提到是一处名胜古迹、自然景观、水域、公园、景点、地标、建筑等），或者猜测地点数量大于2，不得分（0.0分）
+                - 正确描述地点的详细分类，没有进行具体地点猜测或者猜测错误，酌情给出0.1~0.24之间的分数
+                - 正确描述地点的详细分类，并进行1-2个错误但合理的具体地点猜测，得0.25分（比如正确猜出是古代皇家园林，猜测是颐和园或者北海公园，实际是圆明园）
+                - 正确的地点名称（可选的正确描述地点的详细分类），得0.5分（正确猜出地点名称）
+            请观察以下给出的正确/错误的例子：
+            1. 示例（正确的地点名称+地址）：
+            正确答案：
+                地点名称：National Japanese American Memorial
+                地点地址：Washington, DC 20001, USA
+            模型分析结论：这里可能是美国华盛顿特区的日裔美国人拘留营纪念碑所在地
+            {
+                "analysis": "地点名称为 National Japanese American Memorial（美国国家日裔美国人纪念碑），地址为华盛顿特区（Washington, DC 20001, USA）。地点地址描述部分：模型正确分析出了地点所在的城市（华盛顿特区），得0.5分；地点名称部分：模型分析结论虽然用'可能是'这样的推测性语气，但明确指出了该地是美国华盛顿特区的日裔美国人拘留营纪念碑，与实际地点名称完全对应，因此得0.5分。总分：0.5+0.5=1.0分",
+                "score": 1.0
+            }
+            2. 示例（正确的地址城市+准确的地点描述+没有进行具体地点猜测）：
+            正确答案：
+                地点名称：The Georgian House (National Trust for Scotland)
+                地点地址：7 Charlotte Square, Edinburgh EH2 4DR, UK
+            模型分析结论：这里可能是英国爱丁堡新城的乔治亚风格联排街区。
+            {
+                "analysis": "地点名称为 The Georgian House，经翻译为乔治亚风格房屋博物馆。地点地址描述部分：模型正确分析出了地点位于爱丁堡，得0.5分；地点名称部分：模型分析结论提到这里可能是英国爱丁堡新城的乔治亚风格联排街区，地点描述整体准确，但是具体地点描述不够准确，因此需要在0.1~0.24分之间酌情判分，基于模型给出了正确具体地点的描述，只是不够准确，因此给出0.2分的得分。总分：0.5+0.2=0.7分",
+                "score": 0.7
+            }
+            3. 示例（正确的地址城市+准确的地点描述+1~2个错误但合理的猜测）：
+            正确答案：
+                地点名称：Summer Palace
+                地点地址：19 Xin Jian Gong Men Lu, Hai Dian Qu, China, 100091
+            模型分析结论：这个地方可能是北京的一个著名历史景点，如北海公园或故宫。
+            {
+                "analysis": "地点名称'Summer Palace'翻译为中文即为'颐和园'，地址位于中国北京市海淀区新建宫门路19号。地点地址描述部分：模型正确分析出了地点位于北京，得0.5分；地点名称部分：模型正确分析出了地点的详细分类（著名历史景点）并进行了合理猜测，模型猜测该地为'北海公园或故宫'，虽然两个都是错误猜测，但是比较合理，因此这一部分可以获得0.25分。总分：0.5+0.25=0.75分",
+                "score": 0.75
+            }
+            4. 示例（错误的城市名和地点名称）
+            正确答案：
+                地点名称：Haidian Park
+                地点地址：2 Xin Jian Gong Men Lu, Hai Dian Qu, China, 100086
+            模型分析结论：这是位于中国河北省承德市的承德避暑山庄
+            {
+                "analysis": "地点名称'Summer Palace'翻译为中文为‘海淀公园’，位于中国北京市。地点地址描述部分：模型分析的地址为'中国河北省承德市'，国家预测正确，但省份和城市预测错误，因此获得0.1分；地点名称部分：模型没有对地点的进行详细分类，并且具体地点猜测为'承德避暑山庄'，猜测错误。因此该部分不得分(0.0分）。总分：0.1+0.0=0.1分",
+                "score": 0.1
+            }
+            5. 示例（模糊的地点描述）
+            正确答案：
+                地点名称：海淀清真寺
+                地点地址：Zhongguancun, Haidian District, China, 100086
+            模型分析结论：可能是一个位于北京的具有历史和文化价值的旅游景点或古代建筑
+            {
+                "analysis": "地点地址描述部分：模型分析判断图片中的建筑位于北京，属于正确描述到城市一级，可以获得0.5分；地点地址描述部分：模型描述了建筑风格，但并未明确指出具体地点‘海淀清真寺’或者其精确地址，而只是以模糊的‘古代建筑’、‘旅游景点’来描述。根据要求，不得分（0.0分）。总分：0.5+0.0=0.5分",
+                "score": 0.5
+            }
+            6. 示例（猜测地点数量大于两个）
+            正确答案：
+                地点名称：Yuanmingyuan Park
+                地点地址：275X+67P圆明园 Haidian District, China, 100084
+            模型分析结论：可能是北京的景点，如故宫、颐和园、北海公园、圆明园或者其他公园
+            {
+                "analysis": "地点名称'Yuanmingyuan Park'翻译为中文为'圆明园公园'，位于中国北京市。地点地址描述部分：模型正确分析出了地点位于北京市，属于正确描述到城市一级，可以获得0.5分；地点地址描述部分：模型分析结论中未进行地点分类描述，而且进行了多个地点的猜测，超过了两个猜测地点的数量上限，因此不得分（0.0分）。总分：0.5+0.0=0.5分",
+                "score": 0.5
+            }
+            7. 示例（完全错误的地点地址但合理的地点详细分类）
+            正确答案：
+                地点名称：Eglise Notre Dame
+                地点地址：2 Rue de l\'Église, 92100 Boulogne-Billancourt, France
+            模型分析结论：意大利某座历史悠久的基督教教堂
+            {
+                "analysis": "地点名称'Eglise Notre Dame'翻译为中文为'圣母院'，位于法国巴黎。地点地址描述部分：模型错误分析地点为意大利，在国家层级错误，因此不得分（0.0分）；地点名称部分：模型分析结论中有合理的地点详细分类描述（教堂），因此得分（0.2分）。总分：0.0+0.2=0.2分",
+                "score": 0.2
+            }
+            8. 示例（部分正确的地点地址和错误的地点详细分类）
+            正确答案：
+                地点名称：上党门
+                地点地址：中国山西省长治市潞州区天晚集北路54P4+VRX 邮政编码: 046099
+            模型分析结论：中国山西省晋中市平遥县的平遥古城
+            {
+                "analysis": "地点地址描述部分：模型分析地点为中国山西省晋中市，在省级行政区层面正确，因此得分0.25分；地点名称部分：模型分析结论中为平遥古城，与正确地点名称上党门的地点详细分类不同，因此不得分（0.0分）。总分：0.25+0.0=0.25分",
+                "score": 0.25
+            }
+            9. 示例（错误的地点地址和模糊的地点详细分类）
+            正确答案：
+                地点名称：神戸の壁・鎮魂と復興のベンチ
+                地点地址：Japan, 〒651-0073 Hyogo, Kobe, Chuo Ward, Wakinohamakaigandōri, 1-chōme−5−２ 東館
+            模型分析结论：中国某城市的纪念性地标
+            {
+                "analysis": "地点地址描述部分：模型分析地点为中国某城市，在国家层面错误，因此不得分（0.0分）；地点名称部分：模型分析结论中仅仅提及为某处地标，过于模糊，不得分（0.0分）。总分：0.0+0.0=0.0分",
+                "score": 0.0
+            }
+            10. 示例（缺失地点地址和过于模糊的地点详细分类）
+            正确答案：
+                地点名称：东钱湖
+                地点地址：中国宁波市鄞州区东钱湖
+            模型分析结论：某个湖泊景区
+            {
+                "analysis": "地点地址描述部分：模型没有给出地点分析，因此不得分（0.0分）；地点名称部分：模型分析结论中仅仅提及为某个湖泊景区，对于地点名称的分析过于模糊，不得分（0.0分）。总分：0.0+0.0=0.0分",
+                "score": 0.0
+            }
+            请你参考以上示例，对模型分析结论进行判断。输出时，请用以下JSON格式输出你的判断：
+            {
+                "analysis": "判断分析",
+                "score": 评价分数
+            }
+            正确答案：
+                地点名称: {place_name}
+                地点地址: {address}
+            模型分析结论: {predict}
+
+    mmsi_verifier_config:
+        verifier_type: "mmsi"
+        sympy_tolerance: 0.9 # 注意是0.9不是1.0
+        strict_boxed_extraction: true # Math answers usually need to be in \boxed{}
+        # Optional: if MathVerifier needs to fallback to an LLM judge for tricky cases
+        enable_llm_judge_fallback: true
+        llm_api_key: "your_api_keys"
+        llm_judge_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model: glm-4-flash
+        llm_judge_prompt_template: |
+            ### Task
+            You are a perfect math verifier. Your task is to evaluate if the generated `Response` is mathematically equivalent to the `Ground Truth` answer, strictly considering the context provided by the `Question`. Based *only* on the `Question` and the mathematical equivalence between the `Response` and `Ground Truth`, respond **only** with `1.0` or `0.0`. **Do not provide any explanations, reasoning, or thinking process.** Your output must be solely the numerical score.
+
+            **Evaluation Criteria:**
+
+            * Assign **`1.0`** if the `Response` is **mathematically equivalent** to the `Ground Truth` in the context of the `Question`.
+            * Assign **`0.0`** if the `Response` is **incorrect** or **partially incorrect** in any way that changes its mathematical value or meaning compared to the `Ground Truth`, considering the `Question`.
+
+            ---
+
+            **Score `1.0`: Mathematically Equivalent**
+
+            This means the `Response` represents the exact same mathematical value, expression, set, or concept as the `Ground Truth`, even if the notation or form differs. Equivalence includes:
+
+            * **Numerical Formats:** `1.5` vs `3/2`; `0.5` vs `1/2`; `100` vs `1e2`; `4` vs `4.0`.
+            * **Symbolic Representation:** `x*y` vs `xy`; `\frac{1}{2}` vs `1/2`; `pi` vs `π`; `sqrt(x)` vs `√x`; `\angle{ABC}` vs `∠ABC`; `\alpha` vs `α`; `\in` vs `∈`; `\times` vs `×`; `\cdot` vs `·`; `零` vs `0`; `²` vs `^2`; `³` vs `^3`; `\leqslant` vs `≤`; `\geqslant` vs `≥`; `\neq` vs `≠`.
+            * **Algebraic Equivalence:** `(x+1)^2` vs `x^2+2x+1`; `2x+3` vs `3+2x`; `y = 2x + 3` vs `2x - y + 3 = 0`.
+            * **Simplification:** Unsimplified but correct answers are equivalent to the simplified `Ground Truth` (e.g., `4/8` vs `1/2`; `x + x` vs `2x`).
+            * **Units:** Presence or absence of units is acceptable if the numerical value is correct and the `Question` doesn't strictly require units (e.g., `15` vs `15 meters`).
+            * **Notation:** Different but standard notations for the same concept (e.g., `72 degrees` vs `72°`; `>` vs `greater than`; interval notation `(5, \infty)` vs inequality `x>5`).
+            * **Sets/Lists (Unordered):** If the `Ground Truth` represents an unordered collection (like a set of solutions), order differences are acceptable. Different separators (comma, semicolon, space) are fine. Both `Response` and `Ground Truth` must contain the *exact same elements* with the *exact same multiplicity*.
+                * Example: `Response: {2, 1, 3}` vs `Ground Truth: {1, 2, 3}` → **1.0**
+                * Example: `Response: 1; 3; 2` vs `Ground Truth: 1, 2, 3` → **1.0** (if context/`Question` implies order doesn't matter)
+
+            ---
+
+            **Score `0.0`: Incorrect or Partially Incorrect**
+
+            This includes any deviation that makes the `Response` mathematically different from the `Ground Truth`, considering the context of the `Question`. Pay close attention to:
+
+            * **Approximation Errors:** ANY approximation of an exact `Ground Truth` is incorrect, unless the `Ground Truth` itself is explicitly an approximation or specifies acceptable rounding per the `Question`.
+                * ❌ `Response: 3.14` → `Ground Truth: π` → **0.0**
+                * ❌ `Response: 1.414` → `Ground Truth: sqrt(2)` → **0.0**
+                * ❌ `Response: 0.33` → `Ground Truth: 1/3` → **0.0**
+                * ❌ `Response: 0.67` → `Ground Truth: 2/3` → **0.0**
+            * **Precision/Rounding Errors:** Incorrect rounding or providing a rounded answer when an exact form is required by the `Question` or `Ground Truth`.
+                * ❌ `Response: 1.7` → `Ground Truth: 1.73` (if specific precision required) → **0.0**
+                * ❌ `Response: rounded to 4` → `Ground Truth: 4.2` → **0.0**
+            * **Calculation Errors:** Basic arithmetic mistakes, sign errors, order of operation errors.
+                * ❌ `Response: 5+3*2 = 16` → `Ground Truth: 11` → **0.0**
+                * ❌ `Response: -5` → `Ground Truth: 5` → **0.0**
+            * **Conceptual & Algebraic Errors:** Incorrect formula application, wrong variable used, errors in algebraic manipulation (factoring, expanding, solving).
+                * ❌ `Response: x^2+y^2` → `Ground Truth: (x+y)^2` (i.e., `x^2+2xy+y^2`) → **0.0**
+                * ❌ `Response: Area = length + width` → `Ground Truth: Area = length * width` → **0.0**
+            * **Incompleteness / Partial Answers:** Missing solutions, missing components of a multi-part answer requested by the `Question`, providing only one condition when multiple are required.
+                * ❌ `Response: x=2` → `Ground Truth: x=2 or x=-2` → **0.0**
+                * ❌ `Response: The answer is 5` → `Ground Truth: 5 and 7` (if `Question` asked for two numbers) → **0.0**
+                * ❌ `Response: x > 3` → `Ground Truth: 3 < x < 10` → **0.0**
+            * **Extraneous Solutions:** Including incorrect solutions alongside correct ones.
+                * ❌ `Response: x=1, x=-3` → `Ground Truth: x=1` (where x=-3 is an extraneous root) → **0.0**
+            * **Incorrect Order (When Order Matters):** For coordinates, vectors, sequences, matrices, etc., where order is significant based on the `Question` or mathematical convention.
+                * ❌ `Response: (3, 2)` → `Ground Truth: (2, 3)` → **0.0**
+                * ❌ `Response: [1, 3, 2]` → `Ground Truth: [1, 2, 3]` (if `Question` implies order matters) → **0.0**
+            * **Incorrect Set/List Elements:** Wrong numbers, missing elements, extra elements, or incorrect multiplicity.
+                * ❌ `Response: {1, 3}` → `Ground Truth: {1, 2, 3}` → **0.0**
+                * ❌ `Response: {1, 1, 2}` → `Ground Truth: {1, 2}` → **0.0**
+                * ❌ `Response: {1, 2, 4}` → `Ground Truth: {1, 2, 3}` → **0.0**
+            * **Fundamental Format Mismatches:** Providing an answer in a fundamentally different mathematical structure than required by the `Question`.
+                * ❌ `Response: 5` (scalar) → `Ground Truth: (5, 0)` (vector/coordinate, if `Question` asked for a point) → **0.0**
+                * ❌ `Response: positive` → `Ground Truth: x > 0` (if `Question` required a mathematical expression) → **0.0**
+            * **Non-Mathematical or Avoidant Responses:** Responses that avoid answering the question by stating lack of information, ambiguity, or insufficiency—when the `Ground Truth` clearly indicates a mathematically valid answer.
+                * ❌ `Response: Insufficient information` → `Ground Truth: Line KO is annotated as x` → **0.0**
+                * ❌ `Response: Insufficient information` → `Ground Truth: Angle GIY is annotated as 77` → **0.0**
+            * **Incorrect or Incomplete List of Elements (Entities, Labels, Points, etc.):** If the `Response` provides an incorrect set of named elements (e.g., points, angles, labels) compared to the `Ground Truth`, whether due to missing elements, wrong elements, or wrong grouping.
+                * ❌ `Response: Q, B, A, L` → `Ground Truth: The point lying on circle F are B, L, Q` → **0.0**
+                * ❌ `Response: R, E, M, X, L, W` → `Ground Truth: The point lying on circle A are E, M, R, W, X` → **0.0**
+            * **Incorrect Object Referencing or Mismatched Entities:** If the response refers to the wrong geometric objects or mismatches the identity of mathematical entities, even if similar terms are used.
+                * ❌ `Response: angle BKH` → `Ground Truth: Angle BNH is equal to angle NHB` → **0.0**
+
+            ---
+
+            ### Input:
+
+            Question: {question}
+            Response: {predict}
+            Ground Truth: {label}
+
+            ### Output:
+            Respond **strictly and only** with `1.0` or `0.0`. Do **not** provide any explanations or justification.
+        llm_max_tokens: 2048
+        llm_temperature: 0.1
+        llm_top_p: 1.0
+
+    math_verifier_config:
+        verifier_type: "math"
+        sympy_tolerance: 1.0e-6
+        strict_boxed_extraction: true
+        enable_llm_judge_fallback: true
+        llm_api_key:
+          - "your_api_keys"
+        llm_judge_url:
+          - "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model:
+          - glm-4-flash
+        llm_max_tokens: 4096
+        llm_temperature: 0.01
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            You are an expert mathematical evaluator. Your task is to compare a generated 'Response' with a 'Ground Truth' answer for a given 'Question' and provide a score of 1.0 for a perfect match and 0.0 otherwise.
+
+            **Important Context: You are a text-only model.**
+            You will NOT see any images, even if the 'Question' mentions them (e.g., "Based on the image..."). Your entire evaluation must be based solely on the text provided in the 'Question', 'Response', and 'Ground Truth'. Do not attempt to infer or hallucinate image content.
+
+            **Primary Scoring Principle**
+
+            The 'Response' must be **definitive, unambiguous, and mathematically equivalent** to the 'Ground Truth'. It should be presented in a direct and standard mathematical format.
+
+            **Detailed Scoring Rules**
+
+            **Score 1.0 if the Response meets ALL of the following criteria:**
+            1.  **Correctness:** The response is mathematically equivalent to the ground truth.
+            2.  **Completeness:**
+                - If the question has a single answer, the response must provide it.
+                - If the question has multiple solutions that form a complete set (e.g., roots of an equation, all possible values), the response must provide ALL required solutions.
+            3.  **Definitiveness:** The response must be a confident and final answer. It should not express uncertainty, list unrequired alternatives, or use hedging language.
+
+            **Score 0.0 if the Response exhibits ANY of the following flaws:**
+            - It is mathematically incorrect.
+            - It is incomplete (e.g., provides only one of two required solutions).
+            - It is an explanation of the method rather than the answer itself.
+            - It is ambiguous or expresses uncertainty (see "Hacking Patterns" below).
+            - It uses non-standard or obfuscated formats (e.g., Roman numerals, HTML entities).
+
+            **Guidance on Common Scenarios & Hacking Patterns**
+
+            This section helps you differentiate valid responses from "hacking" attempts.
+
+            **1. Handling Multiple Answers: Complete Solution vs. Uncertain Hedging**
+
+            - **VALID (Score 1.0):** The response lists all required parts of a complete solution set. This is common for solving equations.
+            - **Example:**
+                - Question: `Solve x² = 4.`
+                - Ground Truth: `x = ±2`
+                - Response: `x = 2 or x = -2` -> **Score 1.0** (This is a complete, definitive solution set).
+
+            - **HACKING (Score 0.0):** The response lists alternatives because it is uncertain, or adds vague, catch-all phrases.
+            - **Examples:**
+                - Response: `10 (or 8)` vs. Ground Truth: `10` -> **Score 0.0** (Indicates uncertainty between two distinct possibilities).
+                - Response: `平行四边形（或矩形、菱形等合理答案）` vs. Ground Truth: `平行四边形` -> **Score 0.0** (The phrase "等合理答案" is a clear hedging pattern).
+                - Response: `正确（或错误）` vs. Ground Truth: `正确` -> **Score 0.0** (Provides mutually exclusive options for a single-answer question).
+
+            **2. Handling Formatting & Representation**
+
+            - **VALID (Score 1.0):** The response uses standard, mathematically equivalent formats.
+            - **Examples:**
+                - `3/2` vs. `1.5`
+                - `x(x+1)` vs. `x^2+x`
+                - `a ≤ 4` vs. `(-∞, 4]`
+
+            - **HACKING (Score 0.0):** The response uses non-standard or obfuscated formats not typically used in the context of the question.
+            - **Examples:**
+                - `XV` (Roman) vs. `15` (Arabic)
+                - `&#49;&#53;` (HTML entities) vs. `15` (note this you must give 0.0)
+
+            **Method-Only Responses (Score 0.0):**
+            - If the response only provides a description of the method, a formula, a hint, or a general explanation, **but does not directly output a final, definitive answer**, score 0.0.
+
+            **Detailed Scoring Rules:**
+            - **1.0**: The response is mathematically equivalent to the ground truth.
+            - **0.0**: The response is incorrect, incomplete, ambiguous, explanatory in nature, uses encoding, or otherwise fails to convey the same mathematical meaning.
+            **Method-Only Responses (Score 0.0):**
+            - If the response only provides a description of the method, an unsimplified formula, a hint, or a general explanation, **but does not directly output a final, definitive answer**, score 0.0.
+            **General Instructions on Equivalence (Score 1.0 if equivalent):**
+            - **Algebraic Equivalence:** Trivial simplifications, term reordering, and mathematically equivalent forms (e.g., `2x+3` and `3+2x`, `x(x+1)` and `x^2+x`) are acceptable.
+            - **Numerical Equivalence:** Different formats representing the same number are acceptable (e.g., `3/2` and `1.5`; `50%` and `0.5`; `72°` and `72`).
+            - **Multiple Choice:** Either the correct option letter (e.g., 'A') or the content of the correct option is acceptable.
+            - **Lists and Sequences:** If the ground truth requires a list of items, the response must contain all required items. Order may not matter unless specified.
+            - **Intervals:** Different standard notations for the same interval are acceptable (e.g., `(-∞, 4]` and `a ≤ 4`).
+            - **Geometric Naming:** The order of endpoints or vertices does not affect which line, segment, triangle, or polygon is represented.
+                - Lines/segments: "line LI" = "line IL", "segment CD" = "segment DC"
+                - Triangles: "triangle ABC" = "triangle CBA" = "triangle BCA"
+                - Polygons with more vertices: "polygon ABCD" = "polygon DCBA" = "polygon BCDA"
+            - **Unit Guidelines**
+                - If the generated response does not include any units, its numerical value must exactly match the ground-truth value.
+                (Example: ground-truth is "12 m", generated response must be "12"; "13" would be incorrect.)
+                - If the generated response includes units, then:
+                    - The value must either be numerically equivalent to the ground truth (including matching units),
+                    (e.g., "12 m" vs "12 m"),
+                    - Or it must be convertible through correct unit conversion to match the ground-truth value.
+                    (e.g., "1200 cm" is acceptable for "12 m")
+                - Incorrect or mismatched units (e.g., wrong type or wrong scale without proper conversion) will result in a score of 0.0.
+                - If the ground-truth answer does not contain any units, then the units should be determined based on the context of the question.
+
+            **Examples:**
+
+            **Basic Math Equivalence Examples:**
+            Response: 3/2  
+            Ground Truth: 1.5  
+            1.0
+
+            Response: $2x+3$  
+            Ground Truth: $3+2x$  
+            1.0
+
+            Response: $x^2+2x+1$  
+            Ground Truth: $1+2x+x^2$  
+            1.0
+
+            Response: 72 degrees  
+            Ground Truth: 72  
+            1.0
+
+            Response: [number]  
+            Ground Truth: 2  
+            0.0
+
+            Response: 1.0, 2.0, 3.0  
+            Ground Truth: 1.0; 2.0; 3.0  
+            1.0
+
+            **Multiple Choice Examples:**
+            Question: What is the value of x in the equation 2x + 3 = 7?  
+            Choices:  
+            (A) 2  
+            (B) 3  
+            (C) 4  
+            (D) 5  
+            Response: A  
+            Ground Truth: 2  
+            1.0
+
+            Question: What is the value of x in the equation 2x + 3 = 7?  
+            Choices:  
+            (A) 2  
+            (B) 3  
+            (C) 4  
+            (D) 5  
+            Response: 2  
+            Ground Truth: A  
+            1.0
+
+            Question: What is the value of x in the equation 2x + 3 = 7?  
+            Choices:  
+            (A) 2  
+            (B) 3  
+            (C) 4  
+            (D) 5  
+            Response: 3  
+            Ground Truth: A  
+            0.0
+
+            **Algebraic Expression Equivalence:**
+            Response: 1/2x  
+            Ground Truth: x/2  
+            1.0
+
+            Response: 1/2x  
+            Ground Truth: 1/(2x)  
+            0.0
+
+            Response: \\frac{1}{1+\\frac{1}{x}}
+            Ground Truth: \\frac{x}{x+1} 
+            1.0
+
+            Response: \\dfrac{45 - 20\\sqrt{3}}{4} \\text{m}
+            Ground Truth: 2.6 m
+            1.0
+
+            Response: x^2 + x  
+            Ground Truth: x(x+1)  
+            1.0
+
+            Response: x + x  
+            Ground Truth: 2x  
+            1.0
+
+            Response: x + 1  
+            Ground Truth: x^2 + 1  
+            0.0
+
+            Response: x^2 + x + 1  
+            Ground Truth: (x+1)^2  
+            0.0
+
+            **Units and Measurements:**
+            Response: 12 m  
+            Ground Truth: 12  
+            1.0
+
+            Response: 12  
+            Ground Truth: 12 m  
+            1.0
+
+            Response: 12cm
+            Ground Truth: 0.12 m  
+            1.0
+
+            Response: 12  
+            Ground Truth: 12 kg  
+            1.0
+
+            Response: 0.5  
+            Ground Truth: 50%
+            1.0
+
+            Response: 1 m/s
+            Ground Truth: 3.6 km/h
+            1.0
+
+            Question: 1 kg 等于多少 g？
+            Response: 1 kg
+            Ground Truth: 1000 g
+            0.0
+
+            **Lists and Sequences:**
+            Response: 1, 2  
+            Ground Truth: 1; 2; 3  
+            0.0
+
+            Response: D, R, E, C, B, F
+            Ground Truth: The point lying on circle A are B, C, F, E, R
+            0.0
+
+            Response: D, R, E, C, B, F
+            Ground Truth: The point lying on circle A are B, D, C, E, R
+            0.0
+
+            Response: D, R, E, C, B, F
+            Ground Truth: The point lying on circle A are B, C, E, R, D, F
+            1.0
+
+            **Method-only Examples (Always 0.0):**
+            Response: \(\text{Use the Law of Sines to find the missing side length}\)  
+            Ground Truth: 6  
+            0.0
+
+            Response: \boxed{\text{Apply the quadratic formula to solve for x in the equation}}\)  
+            Ground Truth: 2  
+            0.0
+
+            Response: \(\text{Calculate the area using the formula A = πr²}\)  
+            Ground Truth: 25π  
+            0.0
+
+            Response: [Use the Pythagorean theorem to find the hypotenuse]  
+            Ground Truth: 5  
+            0.0
+
+            Response: \(\text{Find the derivative using the power rule}\)  
+            Ground Truth: 2x  
+            0.0
+
+            Response: \(\text{Use the unit circle to find the cosine value}\)  
+            Ground Truth: 1/2  
+            0.0
+
+            Question: 如图1，在矩形ABCD中，AB＜BC，点E为对角线AC上的一个动点，连接BE，DE，过E作EF⊥BC于F．设AE=x，图1中某条线段的长为y，若表示y与x的函数关系的图象大致如图2所示，则这条线段是图1中的______．（写出所有可能的答案）
+            Response: DE
+            Ground Truth: BE \\text{ (or } DE \\text{)}  
+            0.0
+
+            **Chinese Language Equivalence:**
+            Response: 三张桌子和四把椅子
+            Ground Truth: 四把椅子和三张桌子
+            1.0
+
+            Response: 两个苹果和三个香蕉
+            Ground Truth: 三个香蕉和两个苹果
+            1.0
+
+            Response: 五本书和两支笔
+            Ground Truth: 两支笔和五本书
+            1.0
+
+            Response: 张三比李四高，李四比王五高
+            Ground Truth: 李四比王五高，张三比李四高
+            1.0
+
+            Response: 小明比小红跑得快，小红比小华跑得快
+            Ground Truth: 小红比小华跑得快，小明比小红跑得快
+            1.0
+
+            **Interval Notation Examples:**
+            Response: (-∞, 4]
+            Ground Truth: a ≤ 4
+            1.0
+
+            Response: (-2, 4]
+            Ground Truth: a ≤ 4
+            0.0
+
+            Response: (-∞, -2] ∪ [2, ∞)
+            Ground Truth: x ≤ -2 or x ≥ 2
+            1.0
+
+            Response: (-2, 8)
+            Ground Truth: -2 < x < 8
+            1.0
+
+            Response: [-2, 8]
+            Ground Truth: (-2, 8)
+            0.0
+
+            **LaTeX Fraction Examples:**
+            Response: \dfrac{1}{2}
+            Ground Truth: 0.5
+            1.0
+
+            Response: \dfrac{1}{2}
+            Ground Truth: 0.25
+            0.0
+
+            **LaTeX Equation Examples:**
+            Question: Solve sin(x) = 1
+            Response: x = \frac{\pi}{2}
+            Ground Truth: x = \frac{\pi}{2} + 2\pi n
+            0.0
+
+            Question: Solve sin(x) = 1, x in [0, 2\pi]
+            Response: x = \frac{\pi}{2} + 2\pi n
+            Ground Truth: x = \frac{\pi}{2}
+            0.0
+
+            Question: Solve sin(x) = 1
+            Response: x = \frac{\pi}{2} + 2\pi n
+            Ground Truth: x = \frac{\pi}{2} + 2\pi n
+            1.0
+
+            Question: Solve sin(x) = 1
+            Response: x = \frac{\pi}{2} + \pi n
+            Ground Truth: x = \frac{\pi}{2} + 2\pi n
+            0.0
+
+            Question: Solve sin(x) = 1
+            Response: x = \frac{\pi}{2} + 4\pi n
+            Ground Truth: x = \frac{\pi}{2} + 2\pi n
+            0.0
+
+            **Symbol and Function Evaluation Examples (Score 1.0):**
+            Response: √9
+            Ground Truth: 3
+            1.0
+
+            Response: √4
+            Ground Truth: 2
+            1.0
+
+            Response: cos(π)
+            Ground Truth: -1
+            1.0
+
+            Question: What is 5 × 3?
+            Response: &#49;&#53;
+            Ground Truth: 15
+            0.0
+
+            Question: What is 2 + 2?
+            Response: ４
+            Ground Truth: 4
+            1.0
+
+            **LaTeX and Standard Form Equivalence (Score 1.0):**
+            Response: \dfrac{1}{2}
+            Ground Truth: 1/2
+            1.0
+
+            **Interval and Inequality Notation Equivalence (Score 1.0):**
+            Response: a \leq 4
+            Ground Truth: (-\infty, 4]
+            1.0
+            
+            **Distinguishing Answer from Explanation (Score 0.0):**
+            Response: \text{No, the y-intercept is not equal to the slope because the slope is undefined and there is no single y-intercept for a vertical line.}
+            Ground Truth: No
+            0.0
+
+            **Final Instructions:**  
+            Respond with only 1.0 or 0.0. Do not include a rationale.  
+            Question: {question}  
+            Response: {predict}  
+            Ground Truth: {label}
+
+    chemistry_verifier_config:
+        verifier_type: "chemistry"
+        sympy_tolerance: 1.0e-5
+        strict_boxed_extraction: true
+        enable_llm_judge_fallback: true
+        llm_api_key:
+          - "your_api_keys"
+        llm_judge_url:
+          - "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model:
+          - glm-4-flash
+        llm_judge_prompt_template: |
+            You are an answer equivalence validator for scientific questions (chemistry, physics, mathematics). Your task is to decide if the Model Response and the Ground Truth are fully equivalent in meaning, calculation, concept, or substance, **strictly according to the context of the given Question and standard scientific conventions**.
+
+            **ONLY output 1.0 or 0.0. DO NOT output any explanation, reasoning, or extra text under any circumstance.**
+
+            ---
+
+            ## Scoring Criteria
+
+            ### Score 1.0 (Equivalent):
+
+            Output 1.0 if, under the Question’s context and standard scientific interpretation, the Response and Ground Truth represent the same meaning or value even if they differ in:
+            - Chemical formula notation: Answers are considered correct if they use different but equivalent chemical formula notations, such as subscripted numbers, plain numbers, or LaTeX format, as long as they clearly represent the same substance (e.g., "H₂SO₄" = "H2SO4" and MgF_2 = MgF₂)
+            - For chemical equations, as long as the reactants and products are the same and the equation is balanced, differences in the order of terms or the left/right placement are acceptable and should be considered correct (e.g., "Zn + 2HCl → ZnCl₂ + H₂" and "2HCl + Zn → ZnCl₂ + H₂" are equivalent).            
+            - For chemical formulas, if the ground truth specifies a physical state symbol (such as (l), (g), (s), (aq)), a response without a state symbol is still considered correct. However, if the response includes a state symbol that does not match the ground truth (e.g., "CO₂(g)" vs. "CO₂(s)"), it should be considered incorrect. Otherwise, the inclusion or omission of state symbols is acceptable if the compound itself is the same.            - **Unit strict requirement:** If the question explicitly requires a specific unit, the model's response must use that unit; if it uses a different unit (even if it is physically equivalent), it should be scored as 0.0.
+            - **Units or format:** Correct standard conversions (e.g., 1 cal ≡ 4.184 J; 0.5 ≡ 50%; 100% ≡ 1; “m/s” ≡ “米每秒”).
+            - **Expression style:** Mathematical or chemical notation differences as long as the expressions are mathematically/chemically equivalent (e.g., e^(x+y) ≡ e^x * e^y).
+            - **Equivalent synonyms:** Standard/widely accepted names, common names, or symbols (e.g., “乙醇” ≡ “酒精”; “ascorbic acid” ≡ “vitamin C”).
+            - **Formatting:** Trivial formatting, spacing, or order (when the order does not affect meaning, e.g., unordered sets, items).
+            - **Chemical equations:** Minor notation differences (e.g. arrow types, state symbol omission if not critical).
+            - **Fraction, decimal, percentage forms:** Numerically equivalent (e.g., 0.5; 50%; 1/2).
+            - **General and specific correct answers:** If the response provides the general correct reason, it should be accepted as correct, even if it also includes specific substances or additional details.
+            - **Avogadro's number (N_A):** Answers using N_A notation (6.02×10^{23}) are considered correct if numerically equivalent to the ground truth.
+            - **Order questions with explicit instruction:** If the question specifies the order to be filled, the answer can be written directly in sequence (e.g., ABC) without using comparison symbols, as long as the order is correct.
+            - **Element conservation in chemical equations:** Chemical equations must conserve the number of atoms for each element on both sides. If the equation does not maintain this balance, it should not be considered correct.
+            - **Element balancing:** Element counts in chemical equations must be balanced. Both integer and fractional coefficients are allowed. Expressions like "H₂ + 0.5 O₂ → H₂O" and "2H₂ + O₂ = 2H₂O" (as well as "2Na + Cl₂ → 2NaCl" and "Na + 0.5Cl₂ = NaCl") are considered equivalent.
+            - **Reaction conditions:** For chemical reactions, as long as key catalysts are mentioned, other reaction conditions can be more flexible (e.g., "2KClO3在加热和MnO2催化下分解", "2KClO3 → 2KCl + 3O2（MnO2作催化剂）" are equivalent).
+            - **Arrow type:** Single-directional arrows (→), reversible arrows (⇌), and equal signs (=) are all treated as equivalent. Any of these arrows in the model response or ground truth should be considered interchangeable, and differences between them should not affect correctness.
+            - **Science expression equivalence:**
+                - **Scientific concept equivalence:** Use different but scientifically equivalent terms to express the same concept (e.g., "chemical stability" ≡ "cannot burn or support combustion").
+                - **Detailed explanation:** Provide a more detailed correct explanation, including the core points of the standard answer and reasonable supplements.
+                - **Flexible expression:** Use different language styles to express the same scientific fact (e.g., "physical change" ≡ "molecules themselves do not change, only their state changes").
+            - **Chemical expression diversity:**
+                - **Chemical reaction description:** Use different ways to describe the same chemical phenomenon (e.g., "bubble formation, solution color change" ≡ "chemical reaction occurs").
+                - **Experimental phenomenon expression:** Describe the same experimental phenomenon from different angles, as long as it is scientifically accurate.
+                - **Explanation level:** Explain from the molecular/atomic level ≡ explain from the macroscopic level, as long as it is scientifically correct.
+            - **Practical supplement:** Provide useful information in actual operations, beyond the standard answer but scientifically correct.
+            - **Condition constraints:** Clearly state the core experimental conditions or restrictions.
+            - **Allow equivalent answer principle:** If the ground truth explicitly states that certain answers are all reasonable options (e.g., "or CuCl₂, Cu(NO₃)₂, CuO, etc."), then as long as the model answers any of these allowed options, it should be considered correct. Example: Ground Truth: CuSO₄ (or CuCl₂, Cu(NO₃)₂, CuO, etc.) Reponse: CuSO₄
+            - **Open-ended questions:** For open-ended questions, such as those asking for properties or uses, as long as the model's response is consistent with the ground truth in terms of content and meaning, it should be considered correct, regardless of the quantity of information provided. 原料丰富且成本低" equals to 资源丰富、成本低廉、环保、高效。
+            - **Set answer equivalence:** The response is correct if it covers the exact set of correct categories, regardless of order, format (options or full names), or language.
+            - **Fill-in-the-blank questions:** For fill-in-the-blank questions, as long as all key points required by the ground truth are included anywhere in the response, the answer is considered correct, regardless of extra context or wording.
+            - **Value range or mathematical expression:** For fill-in-the-blank questions that require a value range or mathematical expression, the response is considered correct as long as it is mathematically equivalent to the ground truth answer, regardless of whether it is expressed as an inequality, a phrase, or a formula (e.g., if the ground truth is "小于t₁", then "0℃ < t < t₁℃" is also correct).
+            - **Numerical answers with units:** For fill-in-the-blank questions involving numerical answers with units, the response is considered correct as long as it is physically equivalent to the ground truth after appropriate unit conversion, even if the units or formats differ (e.g., "25 °C" and "298 K" are equivalent; "1 nm" and "10⁻⁹ m" are also equivalent).
+            - **Ion or chemical species:** For answers involving ions or chemical species, as long as the response clearly and correctly describes the same ion using either its chemical symbol or a clear verbal description, it should be considered correct (e.g., "F⁻" and "带1个单位负电荷的氟离子" are considered equivalent).
+            ### Score 0.0 (Not Equivalent):
+
+            Output 0.0 in any of the following cases:
+
+            - **Substance, value, formulae, or key information is incorrect, incomplete, or missing.**
+            - **Mathematically/chemically different expressions or results.**
+            - **Wrong or missing units or wrong conversion.**
+            - **Extra or contradictory information.**
+            - **Wrong order if the order is essential (e.g., ordered procedures).**
+            - **Unbalanced chemical equations:** Chemical equations that are not properly balanced should not be considered correct.
+            - **Additional incorrect information:** If the response contains the correct answer but also includes additional incorrect, irrelevant, or contradictory information alongside the correct content, it should be scored as 0.0. Note: Parenthetical explanations or alternative correct answers (e.g., "CuSO4 (or other reasonable copper compounds)") are acceptable, but listing multiple specific substances when only one is required (e.g., "CuSO4、NaOH" when ground truth is "CuSO4") is not equivalent.
+            - **Unit or format:** For fill-in-the-blank questions that require a specific unit or format, the response must use the exact unit or expression specified in the ground truth; mathematically equivalent answers that use a different unit or notation are considered incorrect (e.g., if the ground truth is "15分钟", a response like "15~20 min" should be marked as incorrect).
+            - **State symbol mismatch:** If the response includes a state symbol that does not match the ground truth (e.g., "CO₂(g)" vs. "CO₂(s)"), it should be considered incorrect. Otherwise, the inclusion or omission of state symbols is acceptable if the compound itself is the same.
+            ---
+
+            ### Examples:
+            **Chemistry Formula Examples:**
+
+            Response: 2KClO3在加热和MnO2催化下分解
+            Ground Truth: 2KClO3 → 2KCl + 3O2（MnO2作催化剂）
+            1.0
+
+            Response: H2SO4(aq)
+            Ground Truth: H2SO4(l)
+            0.0
+
+            Response: H₂O(l)
+            Ground Truth: H₂O
+            1.0
+
+            Response: CO₂
+            Ground Truth: CO₂(g)
+            1.0
+
+            Response: NaCl
+            Ground Truth: NaCl(s)
+            1.0
+
+            Response: H₂SO₄
+            Ground Truth: H₂SO₄(aq)
+            1.0
+
+            Response: 2\text{H}^+ + \text{CO}_3^{2-} = \text{CO}_2 \uparrow + \text{H}_2\text{O}
+            Ground Truth: 2H^{+}+CO₃^{2-}═CO₂↑+H₂O
+            1.0
+
+            Response: 2NH_3 + CO2 \xlongequal CO(NH_2)_2 + H_2O
+            Ground Truth: 2NH₃ + CO₂ → CO(NH₂)₂ + H₂O
+            1.0
+
+            Response: H2O ⇌ H+ + OH-
+            Ground Truth: H2O → H+ + OH-
+            1.0
+
+            Response: H2O → H+ + OH-
+            Ground Truth: H2O ⇌ H+ + OH-
+            1.0
+
+            Response: \mathrm{S} + \mathrm{O_2} → \mathrm{SO_2}
+            Ground Truth: S + O₂ → SO₂
+            1.0
+
+            Response: 2H2 + O2 → 2H2O
+            Ground Truth: 2H2 + O2 = 2H2O
+            1.0
+
+            Response: H2 + 0.5 O2 → H2O
+            Ground Truth: 2H2 + O2 = 2H2O
+            1.0
+
+            Response: Zn + 2HCl → ZnCl2 + H2
+            Ground Truth: 2HCl + Zn → ZnCl2 + H2
+            1.0
+
+            Question:发生反应的化学方程式_____。
+            Response: \ce{CuSO4 + 2NaOH = Cu(OH)2↓ + Na2SO4} \quad \text{和} \quad \ce{Cu(OH)2 + H2SO4 = CuSO4 + 2H2O}
+            Ground Truth: 2NaOH + H₂SO₄ → Na₂SO₄ + 2H₂O, 2NaOH + CuSO₄ → Cu(OH)₂↓ + Na₂SO₄
+            0.0
+
+            Question: 反应式为_________。
+            Response: 2Na + Cl2 → 2NaCl
+            Ground Truth: Na + Cl2 → NaCl
+            0.0
+
+            Response: \ce{Zn^{2+}}、\ce{Cu^{2+}
+            Ground Truth: Zn²⁺、Cu²⁺
+            1.0
+
+            Response: \ce{H_2}
+            Ground Truth: H₂
+            1.0
+
+            Question: 化学式是_____．
+            Response: MgF_2
+            Ground Truth: MgF₂
+            1.0
+
+            Response: H₂SO₄
+            Ground Truth: H2SO₄
+            1.0
+
+            Response: MgF_2
+            Ground Truth: MgF₂
+            1.0
+
+            Question: 反应式为_________。
+            Response: \ce{Ag^+ + e^- = Ag}
+            Ground Truth: \(\rm{Ag^{+} + e^{-} \longrightarrow Ag}\)
+            1.0
+
+            Question: 反应式为_________。
+            Response: 2\mathrm{Al} + 2\mathrm{NaOH} + 2\mathrm{H_2O} \xlongequal{} 2\mathrm{NaAlO_2} + 3\mathrm{H_2}↑
+            Ground Truth: 2Al + 2NaOH + 2H₂O = 2NaAlO₂ + 3H₂↑
+            1.0
+
+            Question: 反应式为_________。
+            Response: 2NH_3 + CO \xlongequal CO(NH_2)_2 + H_2O
+            Ground Truth: 2NH₃ + CO₂ → CO(NH₂)₂ + H₂O
+            1.0
+
+            Question: 反应式为_________。
+            Response: CH4 + 2O2 → CO2 + 2H2O + heat
+            Ground Truth: CH4 + 2O2 → CO2 + 2H2O + 光
+            0.0
+
+            **Chemistry Term Examples:**
+
+            Response: 1 nM
+            Ground Truth: 1e-9 mol/L
+            1.0
+
+            Response: 3N_A
+            Ground Truth: 1.806×10²⁴
+            1.0
+
+            Response: 双置换反应
+            Ground Truth: 复分解反应
+            1.0
+
+            Response: 复分解反应
+            Ground Truth: 双置换反应
+            1.0
+
+            Response: 中和反应
+            Ground Truth: 酸碱中和反应
+            1.0
+
+            Response: 酒精
+            Ground Truth: 乙醇
+            1.0
+
+            Response: 石灰水
+            Ground Truth: 氢氧化钙溶液
+            1.0
+
+            Response: 苯酚
+            Ground Truth: 石炭酸
+            1.0
+
+            Response: 氢氧化钠
+            Ground Truth: 强碱溶液
+            0.0
+
+            Response: 单置换反应
+            Ground Truth: 置换反应
+            1.0
+
+            Response: 单质
+            Ground Truth: 元素
+            0.0
+
+            Response: 元素
+            Ground Truth: 单质
+            0.0
+
+            Response: 单置换反应
+            Ground Truth: 复分解反应
+            0.0
+
+            Response: 分子
+            Ground Truth: 极性分子
+            0.0
+
+            Response: 盐
+            Ground Truth: 碱
+            0.0
+
+            Response: 25 °C
+            Ground Truth: 298 K
+            1.0
+
+            Response: 1 nm
+            Ground Truth: 10⁻⁹ m
+            1.0
+
+
+
+            **Chemistry Description Examples:**
+            Response: 不能燃烧也不支持燃烧
+            Ground Truth: 化学性质稳定
+            1.0
+
+            Response: 调节酸液滴入锌粒的速度，可以影响氢气的生成速率
+            Ground Truth: 通过控制酸液加入速度，能调节锌和酸反应的快慢
+            1.0
+
+            Response: 烧杯底部有晶体析出；塑料块下沉
+            Ground Truth: 试管内有硝酸钾晶体析出，塑料板浸入溶液中的体积增大
+            1.0
+
+            Response: 原料丰富且成本低
+            Ground Truth: 资源丰富、成本低廉、环保、高效
+            1.0
+
+            Question: Zn2+、Cu2+能与NH3、H2O、Cl—等形成配位数为4的配合物。[Zn(H2O)4]SO4中不存在的化学键类型有_______ (填序号）。\na.配位键 b.金属键 c.共价键 d.氢键 e.离子键
+            Response: {b,d}
+            Ground Truth: {d,b}
+            1.0
+
+            Response: CuSO4
+            Ground Truth: CuSO4（或CuCl2、Cu(NO3)2、CuO等合理答案均可）
+            1.0
+
+            Response: CuSO4、NaOH
+            Ground Truth: CuSO4
+            0.0
+
+            Question: 数值是多少_____?(必须用atm为单位)
+            Response: 101325 Pa
+            Ground Truth: 1 atm
+            0.0
+
+            Question: 白磷相关的安全操作是______。
+            Response: 白磷着火点低，水下切割可隔绝氧气并降温防止自燃
+            Ground Truth: 防止白磷与空气接触
+            1.0
+
+            Response: "制取蒸馏水时分子种类不变，水电解时分子分裂为原子"
+            Ground Truth: "制取蒸馏水是物理变化，水电解是化学变化"
+            1.0
+
+            Question: 此方法的优点是 _____。
+            Response: 原料丰富且成本低
+            Ground Truth: 资源丰富、成本低廉、环保、高效
+            1.0
+
+            Question: 防止铁锈蚀的一种方法是______．
+            Response: 涂油
+            Ground Truth: 涂油、刷漆、电镀等
+            1.0
+
+            Question:喝下汽水后会打嗝，原因是______。
+            Response: 汽水中二氧化碳的溶解度随温度升高而减小，喝下后体温使汽水温度升高，二氧化碳气体逸出
+            Ground Truth: 二氧化碳气体从胃中逸出
+            1.0
+
+            举一例节约用水的具体做法______。
+            Response: 淘米水用来浇花
+            Ground Truth: 一水多用
+            1.0
+
+            Response: <
+            GT: ＜
+            1.0
+
+            Question: A和C溶液中溶质的质量分数的大小关系是_____．（用“＜”、“＞”或“=”表示）
+            Response: ＞
+            Ground Truth: A > C
+            1.0
+
+            Question: 观察到______现象
+            Response: 导管内壁出现白色固体
+            Ground Truth: 导管内有凝结的固体
+            1.0
+
+            Question: 水分子由_____构成．
+            模型: 氢原子、氯原子和氧原子
+            GT: 一个氢原子、一个氯原子和一个氧原子
+            1.0
+
+            Question: 含有的物质是_____。
+            Response: NaCl
+            Ground Truth: 氯化钠
+            1.0
+
+            Question: 由高到低的排列顺序为______________
+            Response: BAC
+            Ground Truth: B > A > C
+            1.0
+
+            Question:三物质溶解度由小到大的顺序为_____。
+            Response: A < B < C
+            Ground Truth: A、B、C
+            1.0
+
+            Question: 图中表示的是______；
+            Response: 硒元素的相对原子质量
+            Ground Truth: Se的相对原子质量
+            1.0
+
+            Question: 装置中棉花放置的位置_____。
+            Response: 反应容器的导气管口
+            Ground Truth: 导气管的入口处
+            1.0
+
+            Question: 在该实验中使用的三种材料是？（需要考虑先后顺序）
+            Response: 浓硫酸、石墨、铜
+            Ground Truth: 铜，浓硫酸、石墨
+            0.0
+
+            Question: 在该实验中使用的三种材料是？
+            Response: 浓硫酸、石墨、铜
+            Ground Truth: 铜，浓硫酸、石墨
+            1.0
+            
+            Question: Which types of substances can react with salts? A. Simple substance B. Oxide C. Acid D. Base E. Salt
+            Response: A, D, E
+            Ground Truth: Simple substance, oxide, base
+            1.0
+
+            Question: 为制备纯净的CuCl_{2}•2H_{2}O晶体，实验条件是_____。
+            Response: HCl气流中蒸发浓缩、冷却结晶
+            Ground Truth: 将溶液在较低温度下加热蒸发析出晶体，同时通入氯化氢气体防止水解
+            1.0
+
+            Response: 带1个单位负电荷的氟离子
+            Ground Truth: F⁻
+            1.0
+
+            Question: 实验中进行的各操作的正确顺序为______
+            Response: a、c、b、d、e
+            Ground Truth: cabed（或c,a,b,e,d合理顺序）
+            0.0
+
+            Question: 采用向上排空气法收集，原因是 _____ 。
+            Response: 二氧化碳能溶于水且与水反应，不能用排水法收集；同时二氧化碳密度比空气大，可用向上排空气法收集
+            Ground Truth: 二氧化碳能溶于水
+            1.0
+
+            Question: 甲_____乙（填“＞”、“=”或“＜”）．
+            Response: <
+            Ground Truth: ＜
+            1.0
+
+            Question: 甲_____乙（填“＞”、“=”或“＜”）．
+            Response: <
+            Ground Truth: 乙 > 甲
+            1.0
+
+            Question: 控制的温度范围是_____℃时，能达到图中所示实验现象．
+            Response: 0℃<t< t₁℃
+            Ground Truth: 小于t₁
+            1.0
+
+            Question: 反应处于平衡状态的时间是______。
+            Response: 15~20\\ \\text{min}
+            Ground Truth: 15分钟
+            0.0
+
+            Question: 明矾作用______。
+            Response: 吸附悬浮杂质使杂质沉降
+            Ground Truth: 加快沉降速度
+            1.0
+
+            Question: 实验条件是_____
+            Response: HCl气流中蒸发浓缩、冷却结晶
+            Ground Truth: 将溶液在较低温度下加热蒸发析出晶体，同时通入氯化氢气体防止水解
+            1.0
+            ### Input:
+
+            Question: {question}  
+            Response: {predict}  
+            Ground Truth: {label}
+
+            ### Output:
+
+            ONLY output “1.0” or “0.0”. DO NOT output anything else.
+
+        llm_max_tokens: 2048
+        llm_temperature: 0.01 # Very low temp for deterministic judging
+        llm_top_p: 1.0
+        answer_extraction_regex: "CHEM_ANSWER:\\s*(.*)"
+
+    physics_verifier_config:
+        verifier_type: "physics"
+        # Inherits from MathVerifier
+        sympy_tolerance: 1.0e-5
+        strict_boxed_extraction: true
+        enable_llm_judge_fallback: true
+        llm_api_key:
+          - "your_api_keys"
+        llm_judge_url:
+          - "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model:
+          - glm-4-flash
+        llm_max_tokens: 2048
+        llm_temperature: 0.01
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            You are a rigorous answer equivalence validator. Given a Question, a Response, and a Ground Truth, you must judge whether the Response is fully equivalent to the Ground Truth in the context of the Question, **according to the accepted rules of the relevant subject domain (physics, chemistry, mathematics, etc.) and common knowledge.**
+            **Output MUST be ONLY `1.0` or `0.0`. DO NOT output any explanation or extra words.**
+
+            # Scoring Criteria
+
+            **Score `1.0` (Equivalent, context-aware):**
+
+            Output `1.0` if the Response and Ground Truth are mathematically, physically, or chemically equivalent in the context of the Question.
+            This includes cases where:
+
+            - Different but equivalent units are used (e.g., `1 m/s` vs `3.6 km/h`; `1 cal` vs `4.184 J`; `1 J` vs `1 N·m`)
+            - The numerical difference between the Response and the Ground Truth is less than or equal to 1e-6.
+            - For questions with specified options, the Response includes only those options also present in the Ground Truth.
+            - Values are expressed in trivially different notation (e.g., `72` and `72°`, when the question is about degrees/angles)
+            - Responses use equivalent algebraic or scientific expressions (`e^(x+y)` vs `e^x * e^y`)
+            - Equivalent values are given in different formats or notations (e.g., scientific notation, decimals, integers)
+            - Trivial reordering, formatting, or separator differences (e.g., sets, lists), if order is not essential to the meaning
+            - Equivalent physical or chemical quantities, formulas, or principles, using alternative but correct terms, notation, or symbols
+            - If the model's response and the ground truth differ only by some characters (e.g., a common suffix or prefix), and the core meaning is preserved (such as "电流表" vs "电流"), the answer should be judged as correct.
+            - If in the context of the question, the model's response can convey the same physical or experimental meaning to the question as the ground truth, even if the wording is different, the answer should be judged as correct.
+            - If the question itself provides the unit (such as "J" or "℃") in the answer blank or context, the model's response may omit the unit; as long as the numerical value is correct, the answer should be scored as 1.0.
+            - If the model's response and the ground truth use different words or phrases but convey the same meaning (for example, Response: "被弹起" "bounce up" and Ground Truth: "飞出" "fly out"), the answer should be scored as 1.0.
+            - If the model's response contains additional correct information that is consistent with physical principles, the answer should be scored as 1.0. For example, if the response is "流速大" and the ground truth is "流速增大，压强减小", the answer should be considered correct.
+            - If there are multiple correct answers and the model's response only provides any one of them, the answer should be scored as 1.0. For example, if the ground truth is "图1和图3（或图2和图4）" and the model's response is "①③", the answer should be considered correct.
+            - If the model's response and the ground truth express the same physical meaning or relationship, even if the wording is different, the answer should be scored as 1.0. For example, if the model's response is "质量越大、速度越大，动能越大" and the ground truth is "动能与质量和速度的乘积成正比", the answer should be considered correct.
+            - If the model's response omits the specific type of object (such as "crystal") mentioned in the ground truth, but the description is still correct and applicable in the context of the question, the answer should be scored as 1.0.
+            - If the question does not specifically require unit symbols, the unit symbols in the response and the ground truth may differ, but the numerical values must be the same for the answer to be scored as 1.0.
+
+            **Score `0.0` (Not equivalent or incomplete):**
+
+            Output `0.0` if the Response is incomplete, incorrect, not equivalent, or in cases such as:
+            - If the ground truth is a numerical answer, the response must not contain any value with a different meaning (i.e., unverifiable values are not allowed).
+            - The Response includes options that are not present in the Ground Truth for questions with specified options, such as "increase," "decrease," or "stay the same."
+            - Variable symbols, values, or order of magnitude are wrong or do not match the Question's requirements
+            - Response contains multiple mutually exclusive, alternative, or hedged answers (e.g., "10 (or 8)", "A or B", "20 (or 38.4, 40, etc.)")
+            - Inclusion of unverifiable, ambiguous, undefined, non-numeric, or partially specified answers, or any mixture of correct and incorrect/invalid answers
+            - Algebraic or numerical forms are fundamentally different (e.g., "F = ma" vs "F = mv²/r")
+            - Sequence/order is wrong when the Question specifically requires it
+            - Scientific/physical principle is misapplied or incorrect
+            - Answer is incomplete or partially correct
+            - If the Question explicitly requires the output to include the unit (for example, the prompt says "please write both the value and the unit", or the answer blank/context enforces the unit requirement), the Response must include the correct unit . If the unit is missing, score it as 0.0
+            - If the Question includes a specific symbol (such as "F", "a", "v", etc.), the Response must use the same symbol in its answer to be considered equivalent. Using a different symbol (e.g., answering with "P" when the Question uses "F") is not considered equivalent and should be scored as 0.0
+            - If the correctness of the answer cannot be logically derived or verified, it should be scored as 0.0
+
+            # Examples
+            **Physic Unit Examples:**
+            Response: 1 F  
+            Ground Truth: 1 C/V
+            1.0
+
+            Question: 一个物体的质量是？单位为kg
+            Response: 质量=10
+            Ground Truth: 10kg
+            1.0
+
+            Question: 阻值为 _________$$ Ω$$．
+            Response: \dfrac{15}{4}
+            Ground Truth: 7.5Ω
+            0.0
+
+            Question: 电流表示数是什么
+            Response: \\(\\frac{2.5V}{R}\\)
+            Ground Truth: \\(\\dfrac{2.5}{R}\\,\\text{A}\\)
+            1.0
+
+            **Physic Vectors Examples:**
+            Response: v = d/t  
+            Ground Truth: v⃗ = d⃗/t
+            1.0
+
+            **Physic Equation Examples:**
+            Response: F=ma  
+            Ground Truth: a=F/m
+            1.0
+            
+            Response: P=IV
+            Ground Truth: I=P/V
+            1.0
+
+            Response: sinθ/cosθ
+            Ground Truth: tanθ
+            1.0
+
+            Question: 动摩擦因数μ= ______．
+            Response: \dfrac{2gh - v^2}{2gx}
+            Ground Truth: μ = \frac{gh - \frac{1}{2}v^2}{gx}
+            1.0
+
+            Question: 总功为______。
+            Response: p_2(V_3 - V_1) + p_1(V_2 - V_3)
+            Ground Truth:  \( p_2(V_3 - V_1) - p_1(V_3 - V_2) \)
+            1.0
+
+            动摩擦因数μ=______。
+            Response: \dfrac{b}{gk}
+            Ground Truth: \(\frac{b}{kg}\)
+            1.0
+
+            Response: F = ma  
+            Ground Truth: a = F/m 
+            1.0
+
+            Response: \dfrac{Mv_0^2}{\mu(M + m)g}
+            Ground Truth: \(\frac{M v_{0}^2}{2\mu g (m + M)}\)
+            1.0
+
+            Response: 2B L_{1} L_{2} \\omega \\sin(\\omega t + \\varphi_0)
+            Ground Truth: B L_{1} L_{2} ω sin(ωt + φ_{0})
+            0.0
+
+            Response: v = \\frac{s}{t}
+            Ground Truth: v = \\dfrac{s}{t}
+            1.0
+
+            Question: 物块所受的重力G=_____．
+            Response: F * (OA / OB)
+            Ground Truth: \\dfrac{F \\cdot OB}{OA}
+            1.0
+
+            Response: x = \sqrt{2dH}
+            Ground Truth: $$x = \sqrt{2dh}$$
+            1.0
+
+            **Physic Precision Examples:**
+            Response: π  
+            Ground Truth: 3.1415926
+            1.0
+
+            Response: 6.626 × 10^-34
+            Ground Truth: 6.62607015 × 10^-34
+            1.0
+
+            Response: 6.02e23
+            Ground Truth: 6.022e23
+            1.0
+
+            Response: \dfrac{6\sqrt{2}}{5}\,\text{V}
+            Ground Truth: 1.68V
+            1.0
+
+            **Physic Description Examples:**
+            Question: 求点P的电场强度
+            Response: 两个带正电的小球分别放在点P的左侧和右侧0.2m处
+            Ground Truth: 两个小球放在点P右侧和左侧0.2m处，均带正电
+            1.0
+
+            Question: 物体受重力方向？
+            Response: 竖直向下
+            Ground Truth: 沿地心方向
+            1.0
+
+            Question: 凸透镜能使眼睛看清楚物体的理由是?
+            Response: 凸透镜可以使光线发散，推迟光线会聚，从而将像移到视网膜上
+            Ground Truth: 凸透镜对光线有发散作用（或使像成在视网膜上）
+            1.0
+            
+            Question: 额定电流为I=0.3A的小灯泡的额定功率, 则实验结果的表达式是什么
+            Response: P = 0.3U
+            Ground Truth: P = UI
+            1.0
+
+            Question: 实验中必需下列哪些测量工具是什么？ A．直尺 B．天平 C．秒表 D．游标卡尺
+            Response: 直尺、天平、游标卡尺
+            Ground Truth: ABD
+            1.0
+
+            Question: 松手后，小车将 \\text{转动}', '不会平衡，而是会旋转'
+            Response: 转动
+            Ground Truth: 不会平衡，而是会旋转
+            1.0
+
+            Question: 重力对它做的功为多少J.
+            Response: 4800
+            Ground Truth: 4800J
+            1.0
+
+            Question: 推力$$F_{2}$$ _____ $$15N
+            Response: =
+            Ground Truth: = 15N
+            1.0
+
+            Question: 密度为______ kg/m³．
+            Response: 0.16kg/m^{3}
+            Ground Truth: 0.16kg/m^{3}
+            1.0
+
+
+            Question: 液体的密度$$ρ _{甲}$$______$$ρ _{乙}$$。
+            Response: <
+            Ground Truth: \(\rho_{甲} > \rho_{乙}\)
+            1.0
+
+
+            Question: 如图探究物质的熔化和凝固过程：熔点是_____℃。
+            Response: 45
+            Ground Truth: 45℃
+            1.0
+
+            Question: 长度最短应为______。
+            Response: v_0\sqrt{\dfrac{hmd}{q\varphi}}
+            Ground Truth: $$E_k = \dfrac{1}{2}mv_0^2 + \dfrac{2qh\varphi}{d}$$，$$x = v_0\sqrt{\dfrac{mdh}{q\varphi}}$$
+            1.0
+
+            Question: 电阻R_{3}=_____R_{1}．
+            Response: 2
+            Ground Truth: 2R_1
+            1.0
+
+            Question: “超负荷”的原因可能是______．
+            Response: 用电器总功率过大
+            Ground Truth: 短路或用电器的总功率过大
+            1.0
+
+            Question: 揿动电火花发生器的按钮，随着“呯”的一声响，看到盒盖______。
+            Response: 被弹起
+            Ground Truth: 飞出
+            1.0
+
+            Question: 气泡变小的主要原因是 ______ 。
+            Response: 水蒸气液化导致气泡内气体减少
+            Ground Truth: 气泡上升时其中的水蒸气遇冷液化成水
+            1.0
+
+            Question: 转盘转动的角速度为_____ rad/s时。
+            Response: 30或-30
+            Ground Truth: 30
+            0.0
+                        
+            Question: 下列哪个是正确答案？
+            Response: A B C
+            Ground Truth: A B
+            0.0
+
+            Question: 小明当前受到的力有多大？
+            Response: 20N (38.4N或40N等合理答案均可)
+            Ground Truth: 20N
+            0.0
+
+            Question: 当前小明加速度是多大？
+            Response: a = 9.8 m/s²
+            Ground Truth: g = 9.8 m/s²
+            1.0
+
+            Question: 向心加速度a_{向}的大小和方向是______。
+            Response: a_{\text{向}} = \dfrac{v^2}{R}，方向竖直向上
+            Ground Truth: \(\frac{v^2}{R}\)，方向竖直向上
+            1.0
+
+            Question: 实验中选用毛巾、棉布、木板作为水平表面进行实验，其目的是______。
+            Response: 改变小车受到的阻力
+            Ground Truth: 探究不同阻力对物体运动的影响
+            1.0
+
+            Question: 在“探究光的反射规律”的实验中，得到了不同的数据（见表格）．经检查，三次实验中各角度的测量值都是准确的，但总结的规律却与反射定律相违背，原因应该是______．
+            Response: 测量入射角或反射角时误用镜面代替法线作为夹角的标准
+            Ground Truth: 将反射光线与镜面的夹角作为反射角
+            1.0
+
+            由 ______ $$($$填序号$$)$$图可探究重力势能的大小与物质的高度有关．
+            Response: ①③
+            Ground Truth: 图1和图3（或图2和图4）
+            1.0
+
+            Question: 电阻值有一定的变化，你猜想发生这种现象可能的原因是 _____．
+            Response: 灯丝的电阻随温度的变化而变化
+            Ground Truth: 灯丝的温度变化
+            1.0
+
+            Question: 说明绳子拉力的作用效果是______．
+            Response: 改变小球的运动状态
+            Ground Truth: 改变小球的运动方向
+            1.0
+
+            Question: 体温计在设计时应用了______。
+            Response: 凸透镜
+            Ground Truth: 凸透镜成正立、放大的虚像的特性
+            1.0
+
+            Question: g表示为μ= ______ ．
+            Response: \dfrac{mg - Ma - ma}{Mg}
+            Ground Truth: \( \mu = \frac{mg - (M+m) a}{Mg} \)
+            1.0
+
+            两种液体密度的大小关系是ρ_{液}______ρ_{盐水}。
+            Response: <
+            Ground Truth: ρ_{液} < ρ_{盐水}
+            1.0
+
+            需要使$$A$$、$$B$$满足关系$$m_{A}$$________$$m_{B}$$（选填“$$>$$”、“$$=$$”或“$$<$$”）。
+            Response: <
+            Ground Truth: $$m_{B} > m_{A}$$
+            1.0
+
+            Question: 子弹损失的动能为_____。
+            Response: fs + fd
+            Ground Truth: $f(s+d)$
+            1.0
+
+            Question: 晶体物质熔化过程的特点是______。
+            Response: 熔化过程中温度保持不变
+            Ground Truth: 晶体熔化过程中温度保持不变
+            1.0
+
+            Question: 电流方向是_____．
+            Response: abcd
+            Ground Truth: a→b→c→d→a
+            1.0
+
+            Question: 本实验采用的主要实验方法有______法。
+            Response: 控制变量（或控制变量法）
+            Ground Truth: 控制变量法和转换法
+            1.0
+
+            Question: 可以看到灯泡_____。
+            Response: 闪亮后逐渐熄灭
+            Ground Truth: 先变亮，再逐渐变暗
+            1.0
+
+            Question: 造成这一现象的原因可能是______处发生了短路。
+            Response: R_1
+            Ground Truth: R1处发生了短路
+            1.0
+
+            Question: 重力加速度的大小是多少？
+            Response: 7.6 m/s²
+            Ground Truth: 7.61 m/s²
+            0.0
+
+            Question: 光电效应的基本过程依次是？
+            Response: 光子入射→电子吸收能量→电子逸出
+            Ground Truth: 电子逸出→光子入射→电子吸收能量
+            0.0
+
+            Question: 电流方向是？
+            Response: 从正极流向负极
+            Ground Truth: 由高电位流向低电位
+            1.0
+            
+            Question: 弹簧振子从平衡位置开始一个完整周期的运动顺序？
+            Response: 平衡位置→最大位移→平衡位置→反向最大位移→平衡位置
+            Ground Truth: 最大位移→平衡位置→反向最大位移→平衡位置→平衡位置
+            0.0
+
+            Question: 机械波的产生和传播过程依次是？
+            Response: 振源振动→介质质点振动→波动传播
+            Ground Truth: 波动传播→振源振动→介质质点振动
+            0.0
+
+            Question: 原子核α衰变的过程步骤是？
+            Response: 不稳定核→发射α粒子→形成新核
+            Ground Truth: 形成新核→不稳定核→发射α粒子
+            0.0
+
+            Question: 实验步骤？
+            Response: 准备→操作→记录→分析
+            Ground Truth: 准备 操作 记录 分析
+            1.0
+
+            Question: 电磁波的传播顺序？
+            Response: 电场变化→磁场变化→电磁波传播
+            Ground Truth: 电场变化 磁场变化 电磁波传播
+            1.0
+
+            -----
+
+            # Input format
+
+            Question: {question}  
+            Response: {predict}  
+            Ground Truth: {label}  
+
+            # Output
+
+            Only output `1.0` or `0.0`—do NOT output anything else.
+
+    general_verifier_config:
+        verifier_type: "general"
+        # See docs/regex_cheatsheet.md for full examples
+        answer_extraction_regex: "^<think>(.*?)</think>(?P<answer>.*)$"
+        llm_api_key: "your_api_keys"
+        llm_judge_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model: glm-4-flash # Uses the one from reward_urls or can be direct
+        llm_max_tokens: 2048
+        llm_temperature: 0.01
+        llm_top_p: 1.0
+        llm_judge_prompt_template: |
+            ### Task Description
+            You are a top-tier General Answer Evaluator. Your task is to determine if the predicted answer (`Response`) is factually and semantically equivalent to the reference answer (`Ground Truth`), strictly considering the context provided by the `Question`. Base your judgment **solely** on the provided `Question`, `Response`, and `Ground Truth`. Do not rely on any external knowledge or subjective interpretation. Your output **MUST be *only* `1.0` or `0.0`**, without any explanation, reasoning, or additional text.
+
+            **Evaluation Standards:**
+
+            * If the `Response`, within the context of the `Question`, is **factually and semantically equivalent** to the `Ground Truth`, score **`1.0`**.
+            * If the `Response` contains **factual errors**, **omits key information**, includes **irrelevant or incorrect information**, or **significantly deviates in meaning** from the `Ground Truth`, score **`0.0`**.
+
+            ---
+
+            **Score `1.0`: Factually and Semantically Equivalent**
+
+            This means the `Response` conveys the same core information, facts, concepts, or conclusions as the `Ground Truth`, even with minor differences in wording, format, or detail, as long as the core meaning within the `Question`'s context is identical. Equivalence includes, but is not limited to:
+
+            * **Core Fact Consistency:** Key names, dates, numerical values, events, concepts, relationships, etc., must match.
+            * **Semantic Equivalence:** Expresses the exact same meaning using different words (synonyms, paraphrasing). (e.g., "WWII" vs. "World War Two"; "USA" vs. "United States"; "discovered" vs. "first identified").
+            * **Informational Completeness:** The `Response` includes **all critical information** present in the `Ground Truth` that is necessary to answer the `Question`. Omitting minor details from `Ground Truth` that are not essential for the answer is acceptable.
+            * **Formatting Differences:** Minor variations in punctuation, capitalization, or slight grammatical differences are acceptable *if* they do not alter the meaning.
+            * **Numerical Representation:** Equivalent numerical formats (e.g., `1,500` vs `1500`; `5 million` vs `5,000,000`) are acceptable unless specific precision is required by the `Question` or `Ground Truth`.
+            * **Lists/Sets (When order is not specified/implied):** If the `Ground Truth` is an unordered list or set, the `Response` must contain the **exact same core elements**. Differences in order and separators (commas, semicolons, bullet points, etc.) are acceptable.
+                * Example: `Response: apples, bananas, oranges` vs `Ground Truth: bananas, apples, oranges` → **1.0**
+            * **Units/Contextual Details:** The presence/absence or minor variation of units or certain descriptive details is sometimes acceptable if not strictly required by the `Question` or if the context makes them implicit (e.g., `temperature increased` vs `temperature increased by 5 degrees`, depends if the `Question` asked for the specific value).
+
+            ---
+
+            **Score `0.0`: Incorrect, Incomplete, or Not Equivalent**
+
+            Any deviation that makes the `Response` factually incorrect, significantly different in meaning, or incomplete regarding essential information within the `Question`'s context warrants a `0.0`. Pay close attention to:
+
+            * **Factual Errors:** Contains incorrect names, places, times, data, concepts, event descriptions, etc.
+                * ❌ `Response: The capital of France is Berlin` vs `Ground Truth: The capital of France is Paris` → **0.0**
+                * ❌ `Response: Water's chemical formula is HO2` vs `Ground Truth: Water's chemical formula is H2O` → **0.0**
+            * **Omission of Key Information:** Missing critical facts from `Ground Truth` that are necessary to answer the `Question`.
+                * ❌ (Question: List all planets in the solar system) `Response: Earth, Mars` vs `Ground Truth: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune` → **0.0**
+                * ❌ (Question: What is Newton's Second Law?) `Response: Force equals mass` vs `Ground Truth: Force equals mass times acceleration (F=ma)` → **0.0**
+            * **Inclusion of Incorrect/Irrelevant Information (Hallucination):** The `Response` contains information not present in the `Ground Truth` which is false or irrelevant to the `Question`.
+                * ❌ `Response: Einstein proposed relativity and won the Nobel Prize for it` vs `Ground Truth: Einstein proposed relativity` (Note: Nobel was for the photoelectric effect, not relativity) → **0.0**
+            * **Semantic Deviation/Misinterpretation:** Wording fundamentally changes the meaning or misrepresents the core point of the `Ground Truth`.
+                * ❌ `Response: Economic recessions mean lower unemployment` vs `Ground Truth: Economic recessions typically involve higher unemployment` → **0.0**
+            * **Improper Approximation or Level of Detail:** Inappropriately vague when precision is needed, or significantly mismatching the level of detail compared to `Ground Truth` in a way that causes inaccuracy or fails to meet the `Question`'s requirement.
+                * ❌ `Response: About a hundred years ago` vs `Ground Truth: In 1923` (if the specific year is required by the `Question`) → **0.0**
+                * ❌ `Response: He was a good person` vs `Ground Truth: He was known for his extensive charity work` (if the `Question` asked *why* he was known) → **0.0**
+            * **List/Set Errors:** Contains incorrect elements, misses required elements, or includes extraneous (non-equivalent) elements compared to `Ground Truth`.
+                * ❌ `Response: {Red, Yellow, Blue}` vs `Ground Truth: {Red, Green, Blue}` (as primary colors of light) → **0.0**
+            * **Order Errors (When Order Matters):** Incorrect sequence for historical events, process steps, rankings, etc.
+                * ❌ `Response: The US Revolutionary War occurred after the French Revolution` vs `Ground Truth: The French Revolution occurred after the US Revolutionary War` → **0.0**
+            * **Structural Mismatch:** The type or structure of the `Response` does not match what the `Question` requires or the nature of the `Ground Truth`.
+                * ❌ (Question: Who wrote Hamlet?) `Response: A tragedy play` vs `Ground Truth: William Shakespeare` → **0.0**
+
+            ---
+
+            ### Input Format:
+
+            Question: {question}
+            Response: {predict}
+            Ground Truth: {label}
+
+            ### Output Format:
+            Strictly output only `1.0` or `0.0`. Do not include any other characters, spaces, newlines, or explanations.
+
+    chart_verifier_config:
+        verifier_type: "chart"
+        sympy_tolerance: 2.5e-2
+        strict_boxed_extraction: true
+        enable_llm_judge_fallback: true
+        # See docs/regex_cheatsheet.md for full examples
+        answer_extraction_regex: "^<think>(.*?)</think>(?P<answer>.*)$"
+        llm_api_key: "your_api_keys"
+        llm_judge_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model: glm-4-flash # Uses the one from reward_urls or can be direct
+        llm_max_tokens: 2048
+        llm_temperature: 0.1
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            ### Begin of Instruction
+            You should give a score 0 or 1, where 1 means the generated response is perfectly correct and 0 means the generated response is wrong or partially wrong. 
+
+
+            - Mathematical Equivalence: Mathematically equivalent expressions are acceptable (e.g., 3/2 vs 1.5, $2x+3$ vs $3+2x$, $x^2+2x+1$ vs $(x+1)^2$)
+            - Unit Conversion Tolerance: Different but equivalent unit representations are allowed (e.g., 2 m/s vs 7.2 km/h)
+            - Format Flexibility: Reasonable format differences are permitted, including symbol usage, case variations, and punctuation differences (e.g., 72 vs 72°, T vs True, "1.0, 2.0, 3.0" vs "1.0; 2.0; 3.0")
+            - Multiple Choice Simplification: Answer choices can be in full description or simplified form (e.g., "The correct option is B" vs "B")
+            - Additional Information Tolerance: Extra information is allowed if verifiable through general knowledge (e.g., "Paris, France" for "Paris")
+            - Strict Factual Accuracy: Specific facts must be accurate with no tolerance for errors (e.g., years, specific numerical values)
+            - Descriptive Terms: For descriptive phrases, as long as the semantic meaning is similar, they can be considered correct.
+            - Respond with only 1.0 or 0.0. Do not include a rationale.
+
+            ### End of Instruction
+            
+            ### Begin of Samples
+            Here are Examples you can learn from:
+                Response: 3/2
+                Ground Truth: 1.5 
+            1.0
+
+                Response: $2x+3$
+                Ground Truth: $3+2x$
+            1.0
+
+                Response: $x^2+2x+1$
+                Ground Truth: $(x+1)^2$
+            1.0
+
+                Response: 72 degrees
+                Ground Truth: 72
+            1.0
+            (trivial simplifications are allowed)
+
+                Response: 2 m/s
+                Ground Truth: 7.2 km/h
+            1.0
+
+                Response: 72
+                Ground Truth: 72°
+            1.0
+
+                Response: The correct option is B
+                Ground Truth: B
+            1.0
+
+                Response: Option C
+                Ground Truth: C
+            1.0
+
+                Question: Is the sky blue?
+                Response: F
+                Ground Truth: False
+            1.0
+
+                Question: Is the sky blue?
+                Response: T
+                Ground Truth: True
+            1.0
+
+                Question: Is the sky blue?
+                Response: No
+                Ground Truth: False
+            1.0
+
+                Response: [number]
+                Ground Truth: 2
+            0.0
+
+                Question: In which year did the value reach its peak?
+                Response: 2010
+                Ground Truth: 2011
+            0.0
+
+                Response: 1.0, 2.0, 3.0
+                Ground Truth: 1.0; 2.0; 3.0
+            1.0
+            (Additional information is permitted if it can be evaluated based on general world knowledge)
+
+                Question: The capital of China is _____.
+                Response: Beijing, China
+                Ground Truth: Beijing
+            1.0
+            (The use of symbols and case sensitivity are allowed)
+
+                Question: Is the ocean blue?
+                Response: T
+                Ground Truth: True
+            1.0
+                Question: Is the ocean blue?
+                Response: true
+                Ground Truth: True
+            1.0
+
+            **Hexadecimal Representation:**
+                Question: What is 11 + 6?
+                Response: 0x11
+                Ground Truth: 17
+            0.0
+            **If the GT contains two elements and the question involves subtraction, the two elements in the response must be in the same order as in the GT. However, if the question involves addition, the order of the two elements in the response can be different from that in the GT. Please analyze each situation carefully**
+                Question: Which two x-axis labels of 2 sums up to 10.0 ?
+                Response: Beijing and Shanghai
+                Ground Truth: Shanghai, Beijing
+            1.0
+                Question: Which two x-axis labels of Brazil have a difference of -944228398.96 ?
+                Response: 2009, 2006
+                Ground Truth: 2006, 2009
+            0.0
+                Question: Which two x-axis labels of Brazil have a difference of -944228398.96 ?
+                Response: 2006, 2009
+                Ground Truth: 2006, 2009
+            1.0
+            **LaTex Representation: An expression is considered correct only if it is as concise as possible and its value is very close to the ground truth value**
+                Question: What is the mode of Pld?
+                Response: 23 \\text{ and } 56
+                Ground Truth: 23
+            0.0
+                Question: What is the average of Pakistan  from  Exports to  Imports?
+                Response: 5.5 \\times 10^9
+                Ground Truth: 65212962230.44
+            0.0
+                Question: How many objects are liked by more than 80 percent of people?
+                Response: eighteen
+                Ground Truth: 10
+            0.0
+                Question: What is the average of Pakistan  from  Exports to  Imports?
+                Response: \\frac{919}{20}
+                Ground Truth: 43.95
+            0.0
+                Question: What is the average of Pakistan  from  Exports to  Imports?
+                Response: \\frac{900}{20}
+                Ground Truth: 45.00
+            1.0
+            **Ambiguous answers are not allowed**
+
+                Question: What is the sum of the average of 1943.0  and the average of 1965.0 ?
+                Response: \\text{label from the graph (identified by visual inspection or analysis of bar heights)}
+                Ground Truth: 2.0
+            0.0
+            **If there is no GT or Response, then return 0.0**
+                Question: 
+                Response: 
+                Ground Truth: 1.0
+            0.0
+            ### End of Samples
+            
+            ### Below is Your Task 
+            Respond with only 1.0 or 0.0. Do not include a rationale.
+                Question: {question}
+                Response: {predict}
+                Ground Truth: {label}
+
+    multi_image_general_verifier_config:
+        verifier_type: "multi_image"
+        sympy_tolerance: 1.0e-6
+        strict_boxed_extraction: true
+        enable_llm_judge_fallback: true
+        llm_api_key: "your_api_keys"
+        llm_judge_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model: glm-4-flash
+        llm_max_tokens: 2048
+        llm_temperature: 0.01
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            You should give a score 0 or 1, where 1 means the generated response is perfectly correct and 0 means the generated response is wrong or partially wrong. 
+
+            Here are Examples you can learn from:
+                Response: 3/2
+                Ground Truth: 1.5 
+            1.0
+
+                Response: $2x+3$
+                Ground Truth: $3+2x$
+            1.0
+
+                Response: $x^2+2x+1$
+                Ground Truth: $(x+1)^2$
+            1.0
+
+                Response: 72 degrees
+                Ground Truth: 72
+            1.0
+            (trivial simplifications are allowed)
+
+                Response: [number]
+                Ground Truth: 2
+            0.0
+
+                Response: 1 m/s
+                Ground Truth: 3.6 km/h
+            1.0
+
+                Response: 1.0, 2.0, 3.0
+                Ground Truth: 1.0; 2.0; 3.0
+            1.0
+            (multiple choice questions allow the use of options or option content to answer)
+
+                Question: What is the value of x in the equation 2x + 3 = 7?\\nChoices:\\n(A) 2\\n(B) 3\\n(C) 4\\n(D) 5
+                Response: A
+                Ground Truth: 2
+            1.0
+
+                Question: What is the value of x in the equation 2x + 3 = 7?\\nChoices:\\n(A) 2\\n(B) 3\\n(C) 4\\n(D) 5
+                Response: 2
+                Ground Truth: A
+            1.0
+
+                Question: What is the value of x in the equation 2x + 3 = 7?\\nChoices:\\n(A) 2\\n(B) 3\\n(C) 4\\n(D) 5
+                Response: 3
+                Ground Truth: A
+            0.0
+
+
+            Respond with only 1.0 or 0.0. Do not include a rationale.
+                Question: {question}
+                Response: {predict}
+                Ground Truth: {label}
+
+    ocr_verifier_config:
+        verifier_type: "ocr"
+        strict_boxed_extraction: true
+        # > upper_bound reward 1.0
+        # < lower_bound reward 0.0
+        # in between let llm judge
+        # if judge as true, then reward 1.0
+        # if judge as false, then reward similarity score
+        edit_distance_upper_bound: 1.0
+        edit_distance_lower_bound: 0.0
+        ignore_case: false
+        # disable llm judge
+        enable_llm_judge_fallback: false
+        llm_api_key:
+          - "your_api_keys"
+        llm_judge_url:
+          - "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model:
+          - glm-4-flash
+        llm_max_tokens: 2048
+        llm_temperature: 0.1
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            You are a specialized scoring system for OCR answer verification. You need to determine whether the model's OCR output is numerically equivalent to the standard answer.
+
+            **Scoring Criteria:**
+            - Score 1.0: If the model output is mathematically exactly equal to the standard answer
+            - Score 0.0: If the model output is not equal to the standard answer, even small differences are unacceptable
+
+            **Equivalence Rules:**
+            1. **Number Format Equivalence**: Arabic numerals, English numbers, and Chinese numbers are equivalent if they represent the same numerical value
+            2. **Case Insensitive**: Case variations in English numbers do not affect equivalence
+            3. **Format Variation Tolerance**: Decimal points, commas and other format symbols are allowed as long as the numerical value is the same
+            4. **Exact Matching**: OCR results must be completely equal, no approximations allowed
+
+            **Scoring Examples:**
+
+                Response: 五
+                Ground Truth: 5
+            0.0
+
+                Response: twenty-one
+                Ground Truth: 21
+            0.0
+
+                Response: 0
+                Ground Truth: zero
+            0.0
+
+                Response: ONE
+                Ground Truth: 1
+            0.0
+
+                Response: x²
+                Ground Truth: x^2
+            1.0
+
+                Response: α
+                Ground Truth: a
+            1.0
+
+                Response: ½
+                Ground Truth: 1/2
+            1.0
+
+                Response: π
+                Ground Truth: pi
+            1.0
+
+                Response: ∞
+                Ground Truth: infinity
+            1.0
+
+                Response: ∑
+                Ground Truth: sum
+            0.0
+            
+                Response: 2
+                Ground Truth: 3
+            0.0
+
+                Response: twenty-two
+                Ground Truth: 21
+            0.0
+
+                Response: 100
+                Ground Truth: 1000
+            0.0
+
+                Response: 五
+                Ground Truth: 六
+            0.0
+
+                Response: ½ + ⅓
+                Ground Truth: 1/2 + 1/3
+            1.0
+
+                Response: x³
+                Ground Truth: x^2
+            0.0
+
+                Response: β
+                Ground Truth: a
+            0.0
+
+                Response: ⅓
+                Ground Truth: 1/2
+            0.0
+
+            Respond with only 1.0 or 0.0. Do not include a rationale.
+                Question: {question}
+                Response: {predict}
+                Ground Truth: {label}
+    
+    ocr_ignore_case_verifier_config:
+        verifier_type: "ocr"
+        strict_boxed_extraction: true
+        # > upper_bound reward 1.0
+        # < lower_bound reward 0.0
+        # in between let llm judge
+        # if judge as true, then reward 1.0
+        # if judge as false, then reward similarity score
+        edit_distance_upper_bound: 1.0
+        edit_distance_lower_bound: 0.0
+        ignore_case: true
+        # disable llm judge
+        enable_llm_judge_fallback: false
+        llm_api_key:
+          - "your_api_keys"
+        llm_judge_url:
+          - "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model:
+          - glm-4-flash
+        llm_max_tokens: 2048
+        llm_temperature: 0.1
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            You are a specialized scoring system for OCR answer verification. You need to determine whether the model's OCR output is numerically equivalent to the standard answer.
+
+            **Scoring Criteria:**
+            - Score 1.0: If the model output is mathematically exactly equal to the standard answer
+            - Score 0.0: If the model output is not equal to the standard answer, even small differences are unacceptable
+
+            **Equivalence Rules:**
+            1. **Number Format Equivalence**: Arabic numerals, English numbers, and Chinese numbers are equivalent if they represent the same numerical value
+            2. **Case Insensitive**: Case variations in English numbers do not affect equivalence
+            3. **Format Variation Tolerance**: Decimal points, commas and other format symbols are allowed as long as the numerical value is the same
+            4. **Exact Matching**: OCR results must be completely equal, no approximations allowed
+
+            **Scoring Examples:**
+
+            Correct Examples (1.0 points):
+                Response: 2
+                Ground Truth: two
+            0.0
+
+                Response: Three
+                Ground Truth: 3
+            0.0
+
+                Response: 五
+                Ground Truth: 5
+            0.0
+
+                Response: twenty-one
+                Ground Truth: 21
+            0.0
+
+                Response: 0
+                Ground Truth: zero
+            0.0
+
+                Response: ONE
+                Ground Truth: 1
+            0.0
+
+                Response: x²
+                Ground Truth: x^2
+            1.0
+
+                Response: α
+                Ground Truth: a
+            1.0
+
+                Response: ½
+                Ground Truth: 1/2
+            1.0
+
+                Response: π
+                Ground Truth: pi
+            1.0
+
+                Response: ∞
+                Ground Truth: infinity
+            1.0
+
+                Response: ∑
+                Ground Truth: sum
+            1.0
+
+            Incorrect Examples (0.0 points):
+                Response: 2
+                Ground Truth: 3
+            0.0
+
+                Response: twenty-two
+                Ground Truth: 21
+            0.0
+
+                Response: 100
+                Ground Truth: 1000
+            0.0
+
+                Response: 五
+                Ground Truth: 六
+            0.0
+
+                Response: ½ + ⅓
+                Ground Truth: 1/2 + 1/3
+            1.0
+
+                Response: x³
+                Ground Truth: x^2
+            0.0
+
+                Response: β
+                Ground Truth: a
+            0.0
+
+                Response: ⅓
+                Ground Truth: 1/2
+            0.0
+
+            Respond with only 1.0 or 0.0. Do not include a rationale.
+                Question: {question}
+                Response: {predict}
+                Ground Truth: {label}
+    
+    vqa_verifier_config:
+        verifier_type: "vqa"
+        strict_boxed_extraction: true
+        enable_llm_judge_fallback: true
+        llm_api_key:
+          - "your_api_keys"
+        llm_judge_url:
+          - "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model:
+          - glm-4-flash
+        llm_max_tokens: 2048
+        llm_temperature: 0.1
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            You are a specialized scoring system for VQA answer verification. You need to determine whether the model's VQA output is numerically equivalent to the standard answer. You will be given a question directly about an image, a response and a ground truth answer, and you need to determine whether the response is correct or incorrect. You should give a score 1.0 or 0.0, where 1.0 means the generated response is perfectly correct and 0.0 means the generated response is wrong or partially wrong.
+
+            **Primary Principle:**
+            - If the question is about what words are written in the image, then the response should be strictly same as the ground truth, including the case, format, and punctuation.
+            - Before you make a final decision, you need to check if there is any example in the scoring examples that is similar to the question and response. If there is, you should use the scoring example to judge the response. Especially mentioned (note this case you must give 0.0) in the scoring examples. For example, if the Response is "Wii", and the response is "doesnotapply", then you should give 0.0. If there is any case exist in the scoring examples, you should based on the scoring examples to judge the response.
+
+            **Scoring Criteria:**
+            - 1.0: The response exactly matches the ground truth in content, value, or meaning (allowing for trivial algebraic or formatting differences).
+            - 0.0: The answer is incorrect, incomplete, partially wrong, or does not match the ground truth in meaning.
+
+            **Question Types:**
+            There are two types of questions:
+            1. OCR questions: If the question is about what words are written in the image, then the response should be strictly same as the ground truth, including the case, format, and punctuation.
+            2. VQA questions: If the question is about the information in the image, then the response should be same as the ground truth just in meaning, and you can follow the equivalence rules to judge the response.
+
+            **Equivalence Rules for VQA questions:**
+            1. **Number Format Equivalence**: Arabic numerals, English numbers, and Chinese numbers are equivalent if they represent the same numerical value
+            2. **Case Insensitive**: Case variations in English letters and meaningless spaces do not affect equivalence
+            3. **Format Variation Tolerance**: Decimal points, commas, calendar formats, and other format symbols are allowed as long as the meaning is the same. If the difference in format between the response and the ground truth affects the meaning, then the response is incorrect.
+            4. **Unanswerable Questions**: If the ground truth indicates that there is no answer, and the response matches the meaning of no answer, then the response is correct.
+            
+            **Scoring Examples:**
+            Correct Response (1.0 points):
+                Question:
+                Response: Guy Andrews
+                Ground Truth: Guy Andrews
+            1.0
+                Question:
+                Response: Christian/Philadel
+                Ground Truth: Christian/Philadel
+            1.0
+                Question:
+                Response: Discount
+                Ground Truth: DISCOUNT
+            1.0
+                Question:
+                Response: Not enough information
+                Ground Truth: <no answer>
+            1.0
+                Question: What does the front of the bus say?
+                Response: No bus is visible in the image, so the front of the bus cannot be described.
+                Ground Truth: doesnotapply
+            1.0
+                Question: what big white letter is on the man's shirt?
+                Response: P
+                Ground Truth: p
+            1.0
+                Question:
+                Response: The content of \"History Log\" is not visible in the provided image.
+                Ground Truth: <no answer>
+            1.0
+                Question:
+                Response: 1
+                Ground Truth: 1.0
+            1.0
+                Question:
+                Response: x+1
+                Ground Truth: 1+x
+            1.0 (note this case you must give 1.0 because they are equivalent)
+                Question:
+                Response: 2
+                Ground Truth: 2.0
+            1.0 (note this case you must give 1.0)
+                Question:
+                Response: U.S.A
+                Ground Truth: USA
+            1.0
+                Question:
+                Response: 340 dollars
+                Ground Truth: $340.00
+            1.0
+                Question: 
+                Response: Stop
+                Ground Truth: stop
+            1.0
+                Question: 
+                Response: e-mail
+                Ground Truth: email
+            1.0
+                Question:
+                Response: United States Postal Service (USPS) Priority Mail
+                Ground Truth: Usps
+            1.0
+                Question:
+                Response: Total Qty
+                Ground Truth: TOTAL  QTY
+            1.0
+                Question:
+                Response: 上海
+                Ground Truth: 上海市
+            1.0
+                Question:
+                Response: Cannot be determined from the provided image
+                Ground Truth: <no answer>
+            1.0
+                Question:
+                Response: C++
+                Ground Truth: C ++
+            1.0
+
+            Incorrect Response (0.0 points):
+                Question:
+                Response: 2
+                Ground Truth: 3
+            0.0
+                Question:
+                Response: 1.0
+                Ground Truth: Unanswerable
+            0.0
+                Question:
+                Response: 5
+                Ground Truth: 6
+            0.0
+                Question:
+                Response: ATLANTIC
+                Ground Truth: ATLANTIC EXPRESS
+            0.0
+                Question:
+                Response: Assist
+                Ground Truth: doesnotapply
+            0.0
+                Question:
+                Response: MIS
+                Ground Truth: XIES
+            0.0
+                Question:
+                Response: Lawrence A. Kane and Kris Wilder
+                Ground Truth: Lawrence A. Kane
+            0.0
+                Question:
+                Response: Neil D. Jespersen and Duane Swank
+                Ground Truth: Neil D. Jespersen
+            0.0
+                Question:
+                Response: Wii
+                Ground Truth: doesnotapply
+            0.0 (note this case you must give 0.0)
+                Question:
+                Response: iPhone
+                Ground Truth: I phone
+            0.0
+                Question: 
+                Response: LORILLARD TOBACCO COMPANY INC.
+                Ground Truth: LRL
+            0.0
+                Question: What words are wrote in the image?
+                Response: sad an 88
+                Ground Truth: sad am 88
+            0.0
+                Question: What is the name of the phone?
+                Response: iPhone
+                Ground Truth: I phone
+            0.0
+
+            Respond with only 1.0 or 0.0. Do not include a rationale.
+            Note: here you need to judge the response based on the question and the ground truth.
+                Question: {question}
+                Response: {predict}
+                Ground Truth: {label}
+    
+    counting_verifier_config:
+        verifier_type: "counting"
+        strict_boxed_extraction: true
+        enable_llm_judge_fallback: true
+        llm_api_key: "your_api_keys"
+        llm_judge_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        llm_model: glm-4-flash
+        llm_max_tokens: 2048
+        llm_temperature: 0.1
+        llm_top_p: 0.01
+        llm_judge_prompt_template: |
+            You are a highly precise scoring system designed for a number counting verification task. Your sole job is to determine if the numerical value in the `Response` is identical to the numerical value in the `Ground Truth`.
+            **Important Context: You are a text-only model.**
+            You will NOT see any images, even if the 'Question' mentions them (e.g., "Based on the image..."). Your entire evaluation must be based solely on the text provided in the 'Question', 'Response', and 'Ground Truth'. Do not attempt to infer or hallucinate image content.
+            **Your Task Step-by-Step:**
+            **Assign Score**:
+                - Output **1.0** if the values are exactly equal.
+                - Output **0.0** if the values are NOT equal. There is no partial credit.
+            **Scoring Examples:**
+
+            Correct Examples (1.0 points):
+                Response: 2
+                Ground Truth: two
+            1.0
+
+                Response: Three
+                Ground Truth: 3
+            1.0
+
+                Response: 1000
+                Ground Truth: 1000.
+            1.0
+
+                Response: 五
+                Ground Truth: 5
+            1.0
+
+                Response: 十只猫
+                Ground Truth: 10
+            1.0
+
+                Response: twenty-one
+                Ground Truth: 21
+            1.0
+
+                Response: 0
+                Ground Truth: zero
+            1.0
+
+                Response: ONE
+                Ground Truth: one
+            1.0
+
+                Response: 42.0
+                Ground Truth: 42
+            1.0
+
+            Incorrect Examples (0.0 points):
+                Response: two
+                Ground Truth: 22
+            0.0
+
+                Response: 12
+                Ground Truth: 21
+            0.0
+
+                Response: thirty
+                Ground Truth: 13
+            0.0
+
+                Response: 100
+                Ground Truth: 10
+            0.0
+
+                Response: 4
+                Ground Truth: five
+            0.0
+
+                Response: zero
+                Ground Truth: 1
+            0.0
+
+                Response: 五朵花
+                Ground Truth: 6
+            0.0
+
+                Response: 三只猫
+                Ground Truth: 4
+            0.0
+
+                Question: <|begin_of_image|><|end_of_image|>\nHow many people are in the photo?
+                Response: 6
+                Ground Truth: five
+            0.0
+                Question: <|begin_of_image|><|end_of_image|>\nHow many people are in the photo?
+                Response: zero
+                Ground Truth: 1
+            0.0
+                Question: <|begin_of_image|><|end_of_image|>\nHow many trees are in the photo?
+                Response: 七棵树
+                Ground Truth: 8
+            0.0
+
+
+            Your final output should be 1.0 or 0.0.
+                Question: {question}
+                Response: {predict}
+                Ground Truth: {label}
+
+    androidworld_verifier_config:
+        verifier_type: "AndroidWorld"
+        extract_answer_file_path: "scripts/gui_agent/AndroidWorld.py"
+        extract_answer_func_name: "extract_answer"
+        judge_func_path: "scripts/gui_agent/AndroidWorld.py"
+        judge_func_name: "judge"
+        load_once: True
+
+    webvoyager_verifier_config:
+        verifier_type: "WebVoyager"
+        extract_answer_file_path: "scripts/gui_agent/WebVoyager.py"
+        extract_answer_func_name: "extract_answer"
+        judge_func_path: "scripts/gui_agent/WebVoyager.py"
+        judge_func_name: "judge"
+        load_once: True
+
+    osworld_verifier_config:
+        verifier_type: "OSWorld"
+        extract_answer_file_path: "scripts/gui_agent/OSWorld.py"
+        extract_answer_func_name: "extract_answer"
+        judge_func_path: "scripts/gui_agent/OSWorld.py"
+        judge_func_name: "judge"
+        load_once: True
+
+    language_mix_verifier_config:
+        verifier_type: "language_mix"
