@@ -1,0 +1,18 @@
+[project]
+name = "pyimsgui"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cupy-cuda11x>=13.5.1",
+    "laspy>=2.6.1",
+    "numpy>=2.3.2",
+    "open3d>=0.19.0",
+    "pillow>=11.3.0",
+    "plyfile>=1.1.2",
+    "pyside6>=6.9.1",
+    "requests>=2.32.4",
+    "seaborn>=0.13.2",
+    "tqdm>=4.67.1",
+]
