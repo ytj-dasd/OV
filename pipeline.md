@@ -89,16 +89,17 @@
 ### 任务2：点云投影批处理
 输入：LAS 点云 + stations。
 处理：复用现有 `pc_proj_preprocess` 逐场景生成投影结果。
-输出：`projected_images/*.png`、`projected_images/*.npz`、`projected_images/num_points.txt`。
+输出：`projected_images/*.png`、`projected_images/*.npz`、`projected_images/num_points.txt`、`projected_images/effective_stations.json`。
 要求：
 1. 每张 `.png` 必有同名 `.npz`。
-2. `.npz` 内 `pts_indices` 不得越界。
-3. 图像渲染采用两层逻辑：
+2. `effective_stations.json` 必须保存实际用于投影的相机外参；若启用了地形高度修正，这里保存修正后的外参。
+3. `.npz` 内 `pts_indices` 不得越界。
+4. 图像渲染采用两层逻辑：
    - 点像素对应关系 `.npz` 仍按“当前像素最近点 + buffer 扩张”生成，保持 2D->3D 回投语义不变。
    - 图像赋色改为 soft-splat：每个点以连续投影坐标向邻域像素发核，像素按空间距离与深度一致性对候选点做加权归一化。
-4. 像素前景深度优先使用“当前像素自己的硬命中点深度”；如果该像素没有硬命中点，则用邻域候选点中的最小深度作为前景深度，再执行 soft-splat 赋色与补连续性。
-5. 因此前景归属和颜色平滑解耦：前景边缘不被邻域核直接抢占，空像素则由邻域点在深度约束下自然补全。
-6. 旧 render_img_gpu 是硬覆盖，谁最近就直接拿谁的颜色，边缘容易出现斑块和发硬的扩张感。新方案是软融合，过渡更自然。旧方案的补洞发生在像素层，已经丢失了子像素信息。新方案从连续 u/v 开始，天然保留子像素几何信息。
+5. 像素前景深度优先使用“当前像素自己的硬命中点深度”；如果该像素没有硬命中点，则用邻域候选点中的最小深度作为前景深度，再执行 soft-splat 赋色与补连续性。
+6. 因此前景归属和颜色平滑解耦：前景边缘不被邻域核直接抢占，空像素则由邻域点在深度约束下自然补全。
+7. 旧 render_img_gpu 是硬覆盖，谁最近就直接拿谁的颜色，边缘容易出现斑块和发硬的扩张感。新方案是软融合，过渡更自然。旧方案的补洞发生在像素层，已经丢失了子像素信息。新方案从连续 u/v 开始，天然保留子像素几何信息。
 ```bash
     uv run main.py
     SOFT_SPLAT_RADIUS_MIN/MAX 控制核大小
@@ -155,21 +156,26 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 ### 任务5：2D->3D 回投 + IoU合并 + 点冲突归属 + 去噪
 输入：
 1. `projected_images/{img_stem}.npz`（`pts_img_indices`, `pts_indices`, `dist_img`）。
-2. `sam_mask/{img_stem}.npz`（`masks/boxes/scores`，以及类别字段）。
-3. 场景 LAS（用于输出实例点云）。
+2. `projected_images/effective_stations.json`（实际用于投影的相机外参）。
+3. `sam_mask/{img_stem}.npz`（`masks/boxes/scores`，以及类别字段）。
+4. 场景 LAS（用于输出实例点云）。
 
 处理：
-1. 将每个 2D mask 通过 `pts_img_indices -> pts_indices` 回投到 3D 点索引集合。
-2. 候选实例两两计算点云 IoU，`IoU >= 0.30` 视作同一实例并合并。
-3. 视角权重使用角度权重（仅角度，不用距离）：
+1. 将每个 2D mask 通过 `pts_img_indices -> pts_indices` 回投到 3D 点索引集合；回投时基于 `effective_stations.json` 计算候选点的相机前向深度，仅保留落在当前像素前景深度 `+0.2m` 范围内的点，形成 scene-level 候选实例。
+2. 候选实例先做类别门控：同原类别允许合并；`1-6` 视为“杆状物大类”，彼此允许合并；`7 行道树` 仅与 `7 行道树` 合并；其他跨类组合暂不合并。
+3. 在类别门控通过后，使用双通道合并：主通道为 `point IoU >= threshold`；补充通道用于 `1-6` 杆状物大类，以及 `8-15` 的同类实例，为 `XY` 中心距离足够小；树木暂不启用该补充通道（待树干拆分实现后再接入）。
+4. 候选合并后，若 merged instance 点数小于 `min-merged-points`，则直接丢弃，不进入后续处理。
+5. 对保留下来的 merged instance，先按 `w_angle * confidence` 累加类别得分，确定最终类别；点归属前执行“非树优先，树删点”，若某点同时属于树实例和非树实例，则保留在非树实例中，并从树实例候选点中剔除。
+6. 树木类实例单独后处理（待实现）：在每个合并后的树实例内部先找树干锚点；若检测到多个树干，则按最近树干重新划分树冠；若只有一个树干，则保持单树。
+7. 点级冲突归属：同一点属于多个实例时，按加权总分取最大实例。
+8. 空间去噪：每实例做空间聚类，仅保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。
+9. 类特定几何去噪（待实现）：在上述结果上进一步剔除不符合类别形态的噪声点，例如围栏的贴地噪声、杆状物脚下的地面外扩点。
+
+视角权重使用角度权重（仅角度，不用距离）：
 
 \[
 w_{angle} = \max\left(0,\ 1 - \frac{|\alpha_{max}-90^\circ|}{90^\circ}\right)
 \]
-
-4. 每个候选实例按 `w_angle * confidence` 累加类别得分，最终取最高分作为实例类别。
-5. 点级冲突归属：同一点属于多个实例时，按加权总分取最大实例。
-6. 空间去噪：每实例做空间聚类，仅保留主簇，移除离群簇点。
 
 输出（每场景）：
 1. `fusion/{scene_name}_instance_seg.las`：只包含实例点，按场景内实例 ID 随机着色。
@@ -180,11 +186,15 @@ w_{angle} = \max\left(0,\ 1 - \frac{|\alpha_{max}-90^\circ|}{90^\circ}\right)
 python ImgProject/pipeline/task5_scene_instance_seg.py \
   --data-root benchmark \
   --iou-threshold 0.30 \
+  --merge-xy-distance 0.50 \
   --fov-deg 90 \
   --min-mask-points 20 \
+  --backproject-depth-threshold 0.20 \
+  --min-merged-points 150 \
   --denoise-eps 0.60 \
   --denoise-min-points 30
 ```
+
 
 ### 任务6：跨场景边界实例合并
 处理：

@@ -1,4 +1,6 @@
 from typing import Dict, List
+from pathlib import Path
+import json
 import requests
 import numpy as np
 from numpy.typing import NDArray, ArrayLike
@@ -96,6 +98,35 @@ def adjust_camera_height_by_terrain(
     return adjusted_stations
 
 
+def _serialize_stations(stations: List[Dict[str, ArrayLike]]) -> List[Dict[str, list]]:
+    return [
+        {cam: np.asarray(cam_extrinsic, dtype=np.float32).tolist() for cam, cam_extrinsic in station.items()}
+        for station in stations
+    ]
+
+
+def _save_effective_stations_metadata(
+    output_path: Path,
+    stations: List[Dict[str, ArrayLike]],
+    adjust_height: bool,
+    terrain_radius: float,
+    terrain_percentile: int,
+    max_jump: float,
+) -> None:
+    payload = {
+        'station_num': len(stations),
+        'stations': _serialize_stations(stations),
+        'adjust_height': bool(adjust_height),
+        'adjust_height_params': {
+            'terrain_radius': float(terrain_radius),
+            'terrain_percentile': int(terrain_percentile),
+            'max_jump': float(max_jump),
+        },
+    }
+    metadata_path = output_path / 'effective_stations.json'
+    metadata_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
 def pc_proj_preprocess( 
     points: NDArray[np.float32],
     colors: NDArray[np.float32],
@@ -110,11 +141,21 @@ def pc_proj_preprocess(
     terrain_percentile: int = 5,
     max_jump: float = 1.0
 ):
-    output_path = str(output_path)
-    
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
     if adjust_height:
         stations = adjust_camera_height_by_terrain(stations, points, terrain_radius, terrain_percentile, max_jump)
-    
+
+    _save_effective_stations_metadata(
+        output_path,
+        stations,
+        adjust_height,
+        terrain_radius,
+        terrain_percentile,
+        max_jump,
+    )
+
     for station_idx in tqdm(range(len(stations))):
         station = stations[station_idx]
         for cam, cam_extrinsic in station.items():

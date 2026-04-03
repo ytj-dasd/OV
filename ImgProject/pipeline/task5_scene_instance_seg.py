@@ -28,9 +28,12 @@ CLASS_ID_TO_NAME: dict[int, str] = {
     12: "座椅",
     13: "交通锥",
     14: "柱墩",
+    15: "围栏",
 }
 CLASS_NAME_TO_ID = {name: cid for cid, name in CLASS_ID_TO_NAME.items()}
 NUM_CLASSES = len(CLASS_ID_TO_NAME)
+TREE_CLASS_ID = 7
+POLE_LIKE_CLASS_IDS = frozenset({1, 2, 3, 4, 5, 6})
 
 
 @dataclass
@@ -85,6 +88,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-root", required=True, help="Benchmark root containing scene folders.")
     parser.add_argument("--iou-threshold", type=float, default=0.30, help="Point-IoU threshold for merging candidates.")
+    parser.add_argument(
+        "--merge-xy-distance",
+        type=float,
+        default=0.50,
+        help="Supplementary merge distance threshold on candidate XY centers for classes 1-6 and same-class instances in 8-15 after category gating.",
+    )
     parser.add_argument("--fov-deg", type=float, default=90.0, help="Projection horizontal FOV in degrees.")
     parser.add_argument(
         "--min-mask-points",
@@ -92,12 +101,24 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Drop a 2D instance if back-projected points are fewer than this value.",
     )
+    parser.add_argument(
+        "--backproject-depth-threshold",
+        type=float,
+        default=0.20,
+        help="Keep back-projected points whose camera depth is within this many meters of the per-pixel front depth.",
+    )
+    parser.add_argument(
+        "--min-merged-points",
+        type=int,
+        default=0,
+        help="Drop a merged instance before point assignment if its merged point count is below this value.",
+    )
     parser.add_argument("--denoise-eps", type=float, default=0.60, help="Spatial clustering radius (meters).")
     parser.add_argument(
         "--denoise-min-points",
         type=int,
         default=30,
-        help="Minimum points for a valid spatial cluster when denoising each instance.",
+        help="Minimum points required for the retained largest spatial cluster; otherwise drop the instance.",
     )
     parser.add_argument("--output-dir-name", type=str, default="fusion", help="Per-scene output folder name.")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for instance colors in LAS.")
@@ -178,6 +199,71 @@ def _ensure_class_ids(npz: Any, n: int) -> np.ndarray:
     return out
 
 
+def _load_effective_stations(projected_dir: Path) -> list[dict[str, Any]] | None:
+    metadata_path = projected_dir / "effective_stations.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    stations = payload.get("stations")
+    if not isinstance(stations, list):
+        return None
+    return stations
+
+
+def _parse_image_stem(image_stem: str) -> tuple[int, str] | None:
+    prefix = "station_"
+    cam_token = "_cam_"
+    if not image_stem.startswith(prefix) or cam_token not in image_stem:
+        return None
+    station_raw, cam_name = image_stem[len(prefix):].split(cam_token, 1)
+    if not cam_name:
+        return None
+    try:
+        return int(station_raw), cam_name
+    except ValueError:
+        return None
+
+
+def _effective_extrinsic_for_image_stem(stations: list[dict[str, Any]] | None, image_stem: str) -> np.ndarray | None:
+    if not stations:
+        return None
+    parsed = _parse_image_stem(image_stem)
+    if parsed is None:
+        return None
+    station_idx, cam_name = parsed
+    if station_idx < 0 or station_idx >= len(stations):
+        return None
+    station = stations[station_idx]
+    if not isinstance(station, dict) or cam_name not in station:
+        return None
+    try:
+        extrinsic = np.asarray(station[cam_name], dtype=np.float32)
+    except Exception:
+        return None
+    if extrinsic.shape != (4, 4):
+        return None
+    return extrinsic
+
+
+def _mapped_point_depths(points_xyz: np.ndarray, pts_indices: np.ndarray, extrinsic: np.ndarray | None) -> np.ndarray | None:
+    if extrinsic is None or pts_indices.size == 0:
+        return None
+    try:
+        trans_mat = np.linalg.inv(np.asarray(extrinsic, dtype=np.float32))[:3, :]
+    except np.linalg.LinAlgError:
+        return None
+    pts = points_xyz[pts_indices.astype(np.int64, copy=False)]
+    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1), dtype=np.float32)])
+    pts_cam = (trans_mat @ pts_h.T).T
+    return pts_cam[:, 2].astype(np.float32, copy=False)
+
+
+
+
 def _view_weight_from_mask(mask: np.ndarray, fov_deg: float) -> tuple[float, float]:
     ys, xs = np.nonzero(mask)
     if xs.size == 0:
@@ -202,6 +288,9 @@ def _project_mask_to_points(
     pts_img_indices: np.ndarray,
     pts_indices: np.ndarray,
     num_points: int,
+    *,
+    point_depths: np.ndarray | None = None,
+    depth_threshold: float = 0.0,
 ) -> np.ndarray:
     if pts_img_indices.size == 0:
         return np.zeros((0,), dtype=np.int32)
@@ -213,11 +302,32 @@ def _project_mask_to_points(
 
     img_indices = pts_img_indices[valid_img]
     point_indices = pts_indices[valid_img]
+    depth_values = None
+    if point_depths is not None:
+        depth_values = np.asarray(point_depths, dtype=np.float32).reshape(-1)
+        depth_values = depth_values[valid_img]
+        valid_depth = np.isfinite(depth_values) & (depth_values > 0)
+        if not np.any(valid_depth):
+            return np.zeros((0,), dtype=np.int32)
+        img_indices = img_indices[valid_depth]
+        point_indices = point_indices[valid_depth]
+        depth_values = depth_values[valid_depth]
+
     point_keep = flat_mask[img_indices]
     if not np.any(point_keep):
         return np.zeros((0,), dtype=np.int32)
 
+    kept_img_indices = img_indices[point_keep]
     projected = point_indices[point_keep]
+    if depth_values is not None:
+        kept_depth_values = depth_values[point_keep]
+        if depth_threshold > 0:
+            _, inverse = np.unique(kept_img_indices, return_inverse=True)
+            front_depth = np.full((int(inverse.max()) + 1,), np.inf, dtype=np.float32)
+            np.minimum.at(front_depth, inverse, kept_depth_values)
+            depth_keep = kept_depth_values <= (front_depth[inverse] + float(depth_threshold))
+            projected = projected[depth_keep]
+
     valid_pts = (projected >= 0) & (projected < num_points)
     projected = projected[valid_pts]
     if projected.size == 0:
@@ -248,16 +358,89 @@ def _point_iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter) / float(union)
 
 
+def _classes_pass_merge_gate(class_id_a: int, class_id_b: int) -> bool:
+    if class_id_a not in CLASS_ID_TO_NAME or class_id_b not in CLASS_ID_TO_NAME:
+        return False
+    if class_id_a == class_id_b:
+        return True
+    return class_id_a in POLE_LIKE_CLASS_IDS and class_id_b in POLE_LIKE_CLASS_IDS
+
+
+def _candidate_xy_center_distance(a: CandidateInstance, b: CandidateInstance) -> float:
+    center_a = 0.5 * (a.bbox_min[:2] + a.bbox_max[:2])
+    center_b = 0.5 * (b.bbox_min[:2] + b.bbox_max[:2])
+    return float(np.linalg.norm(center_a - center_b))
+
+
+def _supports_xy_supplementary_merge(class_id_a: int, class_id_b: int) -> bool:
+    if class_id_a == 7 or class_id_b == 7:
+        return False
+    if class_id_a in POLE_LIKE_CLASS_IDS and class_id_b in POLE_LIKE_CLASS_IDS:
+        return True
+    return class_id_a == class_id_b and class_id_a in CLASS_ID_TO_NAME
+
+
+def _should_merge_candidates(
+    a: CandidateInstance,
+    b: CandidateInstance,
+    *,
+    iou_threshold: float,
+    merge_xy_distance: float,
+) -> bool:
+    if not _classes_pass_merge_gate(a.class_id, b.class_id):
+        return False
+
+    if _bboxes_overlap(a.bbox_min, a.bbox_max, b.bbox_min, b.bbox_max):
+        if _point_iou(a.point_indices, b.point_indices) >= iou_threshold:
+            return True
+
+    if not _supports_xy_supplementary_merge(a.class_id, b.class_id):
+        return False
+
+    return merge_xy_distance > 0 and _candidate_xy_center_distance(a, b) <= merge_xy_distance
+
+
+def _summarize_candidate_points(candidates: list[CandidateInstance]) -> tuple[int, int]:
+    if not candidates:
+        return 0, 0
+    point_sum = int(sum(int(c.point_indices.size) for c in candidates))
+    point_unique = int(np.unique(np.concatenate([c.point_indices for c in candidates], axis=0)).size)
+    return point_sum, point_unique
+
+
+def _format_scene_backprojection_log(
+    scene_name: str,
+    *,
+    candidate_stats: dict[str, int],
+    candidate_point_sum: int,
+    candidate_point_unique: int,
+) -> str:
+    return (
+        f"[{scene_name}] back-projection: sam_masks={int(candidate_stats['sam_instances_total'])} "
+        f"kept_candidates={int(candidate_stats['sam_instances_kept'])} "
+        f"kept_points_sum={candidate_point_sum} kept_points_unique={candidate_point_unique} "
+        f"filtered_small={int(candidate_stats['sam_instances_filtered_small'])} "
+        f"filtered_invalid_class={int(candidate_stats['sam_instances_filtered_invalid_class'])} "
+        f"missing_sam_files={int(candidate_stats['missing_sam_files'])}"
+    )
+
+
+def _format_iou_merge_log(scene_name: str, candidate_count: int, merged_count: int) -> str:
+    return f"[{scene_name}] IoU merge: candidates={candidate_count} -> merged_instances={merged_count}"
+
+
 def collect_scene_candidates(
     scene_dir: Path,
     points_xyz: np.ndarray,
     *,
     fov_deg: float,
     min_mask_points: int,
+    backproject_depth_threshold: float = 0.20,
 ) -> tuple[list[CandidateInstance], dict[str, int]]:
     projected_dir = scene_dir / "projected_images"
     sam_dir = scene_dir / "sam_mask"
     mapping_files = sorted(projected_dir.glob("station_*_cam_*.npz"))
+    effective_stations = _load_effective_stations(projected_dir)
 
     stats = {
         "mapping_files": len(mapping_files),
@@ -295,6 +478,12 @@ def collect_scene_candidates(
         pts_img_indices = pts_img_indices[valid_pts]
         pts_indices = pts_indices[valid_pts]
 
+        point_depths = _mapped_point_depths(
+            points_xyz,
+            pts_indices,
+            _effective_extrinsic_for_image_stem(effective_stations, image_stem),
+        )
+
         image_shape = tuple(int(x) for x in dist_img.shape)
         try:
             sam_npz = np.load(sam_path, allow_pickle=True)
@@ -313,13 +502,22 @@ def collect_scene_candidates(
 
         for i in range(n_masks):
             class_id = int(class_ids[i])
+            mask = masks[i]
+            projected_points = _project_mask_to_points(
+                mask,
+                pts_img_indices,
+                pts_indices,
+                num_points=num_points,
+                point_depths=point_depths,
+                depth_threshold=float(backproject_depth_threshold),
+            )
+            projected_count = int(projected_points.size)
+
             if class_id not in CLASS_ID_TO_NAME:
                 stats["sam_instances_filtered_invalid_class"] += 1
                 continue
 
-            mask = masks[i]
-            projected_points = _project_mask_to_points(mask, pts_img_indices, pts_indices, num_points=num_points)
-            if projected_points.size < min_mask_points:
+            if projected_count < min_mask_points:
                 stats["sam_instances_filtered_small"] += 1
                 continue
 
@@ -354,6 +552,8 @@ def merge_candidates(
     candidates: list[CandidateInstance],
     *,
     iou_threshold: float,
+    merge_xy_distance: float,
+    min_merged_points: int,
 ) -> tuple[list[SceneInstance], np.ndarray]:
     if not candidates:
         return [], np.zeros((0,), dtype=np.int32)
@@ -364,10 +564,7 @@ def merge_candidates(
         ci = candidates[i]
         for j in range(i + 1, n):
             cj = candidates[j]
-            if not _bboxes_overlap(ci.bbox_min, ci.bbox_max, cj.bbox_min, cj.bbox_max):
-                continue
-            iou = _point_iou(ci.point_indices, cj.point_indices)
-            if iou >= iou_threshold:
+            if _should_merge_candidates(ci, cj, iou_threshold=iou_threshold, merge_xy_distance=merge_xy_distance):
                 uf.union(i, j)
 
     groups: dict[int, list[int]] = {}
@@ -380,6 +577,8 @@ def merge_candidates(
     for root in sorted(groups.keys()):
         group_indices = groups[root]
         union_points = np.unique(np.concatenate([candidates[idx].point_indices for idx in group_indices], axis=0))
+        if union_points.size < max(0, int(min_merged_points)):
+            continue
         class_scores = np.zeros((NUM_CLASSES + 1,), dtype=np.float32)
         for idx in group_indices:
             cand = candidates[idx]
@@ -409,6 +608,48 @@ def merge_candidates(
         )
 
     return merged_instances, candidate_to_instance
+
+
+def _prune_tree_points_before_assignment(
+    candidates: list[CandidateInstance],
+    candidate_to_instance: np.ndarray,
+    instances: list[SceneInstance],
+) -> int:
+    if not candidates or not instances or candidate_to_instance.size == 0:
+        return 0
+
+    non_tree_chunks = [
+        inst.point_indices.astype(np.int32, copy=False)
+        for inst in instances
+        if inst.class_id != TREE_CLASS_ID and inst.point_indices.size > 0
+    ]
+    if not non_tree_chunks:
+        return 0
+    non_tree_points = np.unique(np.concatenate(non_tree_chunks, axis=0))
+    if non_tree_points.size == 0:
+        return 0
+
+    tree_instance_ids = {inst_id for inst_id, inst in enumerate(instances) if inst.class_id == TREE_CLASS_ID}
+    if not tree_instance_ids:
+        return 0
+
+    removed_total = 0
+    for inst_id in tree_instance_ids:
+        inst = instances[inst_id]
+        keep_mask = ~np.isin(inst.point_indices, non_tree_points, assume_unique=False)
+        removed_total += int(inst.point_indices.size - np.count_nonzero(keep_mask))
+        inst.point_indices = inst.point_indices[keep_mask].astype(np.int32, copy=False)
+
+    for cand_idx, cand in enumerate(candidates):
+        if cand_idx >= candidate_to_instance.shape[0]:
+            break
+        inst_id = int(candidate_to_instance[cand_idx])
+        if inst_id not in tree_instance_ids or cand.point_indices.size == 0:
+            continue
+        keep_mask = ~np.isin(cand.point_indices, non_tree_points, assume_unique=False)
+        cand.point_indices = cand.point_indices[keep_mask].astype(np.int32, copy=False)
+
+    return removed_total
 
 
 def assign_points(
@@ -479,13 +720,10 @@ def largest_cluster_mask(points_xyz: np.ndarray, eps: float, min_points: int) ->
     n = int(points_xyz.shape[0])
     if n == 0:
         return np.zeros((0,), dtype=bool)
-    if n < max(1, min_points):
-        return np.ones((n,), dtype=bool)
 
     tree = cKDTree(points_xyz)
     visited = np.zeros((n,), dtype=bool)
     best_any = np.zeros((0,), dtype=np.int32)
-    best_valid = np.zeros((0,), dtype=np.int32)
 
     for start in range(n):
         if visited[start]:
@@ -504,12 +742,10 @@ def largest_cluster_mask(points_xyz: np.ndarray, eps: float, min_points: int) ->
         comp_arr = np.asarray(comp, dtype=np.int32)
         if comp_arr.size > best_any.size:
             best_any = comp_arr
-        if comp_arr.size >= min_points and comp_arr.size > best_valid.size:
-            best_valid = comp_arr
 
-    keep_idx = best_valid if best_valid.size > 0 else best_any
     keep_mask = np.zeros((n,), dtype=bool)
-    keep_mask[keep_idx] = True
+    if best_any.size >= max(1, min_points):
+        keep_mask[best_any] = True
     return keep_mask
 
 
@@ -583,12 +819,25 @@ def _instance_colors(num_instances: int, seed: int) -> np.ndarray:
     return colors
 
 
+def _point_class_ids_from_instances(instances: list[SceneInstance], point_instance_id: np.ndarray) -> np.ndarray:
+    point_class_id = np.zeros(point_instance_id.shape, dtype=np.uint8)
+    if point_instance_id.size == 0 or not instances:
+        return point_class_id
+
+    inst_class_ids = np.asarray([inst.class_id for inst in instances], dtype=np.uint8)
+    valid = (point_instance_id >= 0) & (point_instance_id < inst_class_ids.shape[0])
+    if np.any(valid):
+        point_class_id[valid] = inst_class_ids[point_instance_id[valid]]
+    return point_class_id
+
+
 def write_scene_las(
     output_path: Path,
     las_in: laspy.LasData,
     points_xyz: np.ndarray,
     point_instance_id: np.ndarray,
     *,
+    instances: list[SceneInstance],
     random_seed: int,
 ) -> int:
     selected = np.where(point_instance_id >= 0)[0]
@@ -611,6 +860,15 @@ def write_scene_las(
         las_out.red = rgb16[:, 0]
         las_out.green = rgb16[:, 1]
         las_out.blue = rgb16[:, 2]
+
+        class_ids = _point_class_ids_from_instances(instances, point_instance_id)[selected].astype(np.uint8, copy=False)
+        las_out.classification = class_ids
+
+        extra_bytes_params = getattr(laspy, "ExtraBytesParams", None)
+        add_extra_dim = getattr(las_out, "add_extra_dim", None)
+        if extra_bytes_params is not None and callable(add_extra_dim):
+            las_out.add_extra_dim(extra_bytes_params(name="cls_id", type=np.uint8))
+            las_out.cls_id = class_ids
 
     las_out.write(output_path)
     return int(selected.size)
@@ -675,15 +933,36 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         points_xyz=points_xyz,
         fov_deg=float(args.fov_deg),
         min_mask_points=int(args.min_mask_points),
+        backproject_depth_threshold=float(args.backproject_depth_threshold),
+    )
+    candidate_point_sum, candidate_point_unique = _summarize_candidate_points(candidates)
+    print(
+        _format_scene_backprojection_log(
+            scene_name,
+            candidate_stats=candidate_stats,
+            candidate_point_sum=candidate_point_sum,
+            candidate_point_unique=candidate_point_unique,
+        )
     )
 
-    instances, candidate_to_instance = merge_candidates(candidates, iou_threshold=float(args.iou_threshold))
+    instances, candidate_to_instance = merge_candidates(
+        candidates,
+        iou_threshold=float(args.iou_threshold),
+        merge_xy_distance=float(args.merge_xy_distance),
+        min_merged_points=int(args.min_merged_points),
+    )
+    print(_format_iou_merge_log(scene_name, candidate_count=len(candidates), merged_count=len(instances)))
+    tree_pruned_points = _prune_tree_points_before_assignment(candidates, candidate_to_instance, instances)
+    print(f"[{scene_name}] tree overlap pruning: removed_points={tree_pruned_points}")
     point_instance_id, point_confidence = assign_points(
         candidates,
         candidate_to_instance,
         num_points=num_points,
         num_instances=len(instances),
     )
+
+    assigned_points_before_denoise = int(np.count_nonzero(point_instance_id >= 0))
+    print(f"[{scene_name}] point assignment: assigned_points={assigned_points_before_denoise}")
 
     denoise_log = denoise_assignments(
         points_xyz=points_xyz,
@@ -695,11 +974,17 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     )
 
     instances = rebuild_instances(instances, point_instance_id)
+    assigned_points_after_denoise = int(np.count_nonzero(point_instance_id >= 0))
+    print(
+        f"[{scene_name}] denoise: removed_points={int(denoise_log['removed_points_total'])} "
+        f"final_instances={len(instances)} final_points={assigned_points_after_denoise}"
+    )
     selected_points = write_scene_las(
         output_path=scene_las_path,
         las_in=las_data,
         points_xyz=points_xyz,
         point_instance_id=point_instance_id,
+        instances=instances,
         random_seed=int(args.random_seed),
     )
     save_scene_npz(
