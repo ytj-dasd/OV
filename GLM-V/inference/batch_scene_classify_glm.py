@@ -434,20 +434,35 @@ def main() -> None:
         return
 
     print(f"discovered scenes: {len(scene_dirs)}")
+    pending_scene_dirs: list[Path] = []
+    skipped_scene_count = 0
     for scene in scene_dirs:
-        (scene / "vlm_desc").mkdir(parents=True, exist_ok=True)
+        vlm_desc_dir = scene / "vlm_desc"
+        if vlm_desc_dir.is_dir():
+            skipped_scene_count += 1
+            print(f"[skip scene] {scene.name}: found existing {vlm_desc_dir}")
+            continue
+        pending_scene_dirs.append(scene)
+
+    if not pending_scene_dirs:
+        print("all scenes already processed; nothing to do.")
+        return
+    print(f"scenes to process: {len(pending_scene_dirs)}, skipped: {skipped_scene_count}")
 
     if args.prepare_only:
+        for scene in pending_scene_dirs:
+            (scene / "vlm_desc").mkdir(parents=True, exist_ok=True)
         print("prepare-only enabled; skip model inference.")
         return
 
     print(f"Loading model from: {args.model_path}")
     model, processor = load_glm_model_and_processor(args.model_path)
 
-    for scene_dir in scene_dirs:
+    for scene_dir in pending_scene_dirs:
         projected_images_dir = scene_dir / "projected_images"
         images = collect_images(projected_images_dir)
         vlm_desc_dir = scene_dir / "vlm_desc"
+        vlm_desc_dir.mkdir(parents=True, exist_ok=True)
         scene_summary: list[dict[str, Any]] = []
 
         print(f"\n[scene] {scene_dir.name} images={len(images)}")

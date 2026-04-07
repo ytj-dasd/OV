@@ -472,7 +472,22 @@ def main() -> None:
     if not scene_dirs:
         raise FileNotFoundError(f"No scene with projected_images found under: {data_root}")
 
+    pending_scene_dirs: list[Path] = []
+    skipped_scene_count = 0
     for scene_dir in scene_dirs:
+        sam_mask_dir = scene_dir / "sam_mask"
+        if sam_mask_dir.is_dir():
+            skipped_scene_count += 1
+            print(f"[skip scene] {scene_dir.name}: found existing {sam_mask_dir}")
+            continue
+        pending_scene_dirs.append(scene_dir)
+
+    if not pending_scene_dirs:
+        print("all scenes already processed; nothing to do.")
+        return
+    print(f"scenes to process: {len(pending_scene_dirs)}, skipped: {skipped_scene_count}")
+
+    for scene_dir in pending_scene_dirs:
         run_scene_batch(
             scene_dir=scene_dir,
             sam3_processor=processor,

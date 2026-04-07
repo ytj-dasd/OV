@@ -118,6 +118,7 @@
 1. 每图至少输出空集或命中类集合。
 2. 解析失败支持重试并记录失败原因。
 3. 若某图未命中任何类别，该图后续跳过 SAM。
+4. 场景级跳过：若场景目录下已存在 `vlm_desc/`，则该场景默认视为已处理并跳过。
 ```bash
 # Qwen3-VL
 python Qwen3-VL/infer/batch_scene_classify.py \
@@ -140,6 +141,7 @@ python GLM-V/inference/batch_scene_classify_glm.py \
 输出：`sam_mask/{img_stem}.npz`。
 要求：
 1. 无效实例（面积太小或分数过低）在回投阶段过滤。
+2. 场景级跳过：若场景目录下已存在 `sam_mask/`，则该场景默认视为已处理并跳过。
 ```bash
 python sam3/preprocess/batch_scene_sam_from_vlm.py \
   --data-root benchmark \
@@ -162,25 +164,29 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 
 处理：
 1. 将每个 2D mask 通过 `pts_img_indices -> pts_indices` 回投到 3D 点索引集合；回投时基于 `effective_stations.json` 计算候选点的相机前向深度，仅保留落在当前像素前景深度 `+0.2m` 范围内的点，形成 scene-level 候选实例。
-2. 候选实例先做类别门控：同原类别允许合并；`1-6` 视为“杆状物大类”，彼此允许合并；`7 行道树` 仅与 `7 行道树` 合并；其他跨类组合暂不合并。
-3. 在类别门控通过后，使用双通道合并：主通道为 `point IoU >= threshold`；补充通道用于 `1-6` 杆状物大类，以及 `8-15` 的同类实例，为 `XY` 中心距离足够小；树木暂不启用该补充通道（待树干拆分实现后再接入）。
-4. 候选合并后，若 merged instance 点数小于 `min-merged-points`，则直接丢弃，不进入后续处理。
-5. 对保留下来的 merged instance，先按 `w_angle * confidence` 累加类别得分，确定最终类别；点归属前执行“非树优先，树删点”，若某点同时属于树实例和非树实例，则保留在非树实例中，并从树实例候选点中剔除。
-6. 树木类实例单独后处理（待实现）：在每个合并后的树实例内部先找树干锚点；若检测到多个树干，则按最近树干重新划分树冠；若只有一个树干，则保持单树。
-7. 点级冲突归属：同一点属于多个实例时，按加权总分取最大实例。
-8. 空间去噪：每实例做空间聚类，仅保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。
-9. 类特定几何去噪（待实现）：在上述结果上进一步剔除不符合类别形态的噪声点，例如围栏的贴地噪声、杆状物脚下的地面外扩点。
+2. 候选实例先做类别门控：同原类别允许合并；`1-6` 视为“杆状物大类”，彼此允许合并；`7 行道树` 仅与 `7 行道树` 合并；其他跨类组合暂不合并。在类别门控通过后，使用双通道合并：主通道为 `point IoU >= threshold`；补充通道用于 `1-6` 杆状物大类，以及 `8-15` 的同类实例，为 `XY` 中心距离足够小；树木暂不启用该补充通道，先保持当前 `IoU` 合并强度。候选合并后，若 merged instance 点数小于 `min-merged-points`，则直接丢弃，不进入后续处理。
+3. 对保留下来的 merged instance，先按 `w_angle * confidence` 累加类别得分，确定最终类别；点归属前执行“非树优先，树删点”。若某点同时属于树和围栏，则保留树点并从围栏侧剔除；若某点同时属于树实例和其他非树实例，则保留在非树实例中，并从树实例候选点中剔除。
+4. 点级冲突归属：同一点属于多个实例时，按加权总分取最大实例。
+5. 空间去噪：每实例做空间聚类，仅保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。
+6. 地面点剔除：仅对 `1, 2, 3, 4, 8, 9, 11, 12, 13, 14, 15` 这 `11` 类执行。按实例点云 `z` 值的 `10%` 分位数估计地面高度 `z_ground`，按 `95%` 分位数估计稳健顶部高度；仅使用位于中低高度带（`z > z_ground + 0.50m` 且 `z <= z_ground + 0.70 * (q95(z)-z_ground)`）的支撑点计算水平 `bbox`，向外扩 `2cm`，最后仅删除该 `bbox` 外的低矮地面点。
+7. 围栏重聚类：围栏实例先完成地面点剔除，再把所有 `class_id=15` 的点合并后按 `XY` 连通重新聚类；仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
+8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 读取首个站点高度，并用 `station_z - 2.0m` 估计树木搜索地面；将所有树实例中离地 `0.8-1.4m` 的高度带点汇总，在 `XY` 平面执行 DBSCAN 生成树干候选簇。候选簇需满足点数不少于 `50`、稳健高度范围 `q95(z)-q05(z) > 0.4m`；随后做 TaubinSVD 圆拟合，先判断拟合半径 `r_fit` 小于阈值，再判断径向残差（去掉前后 `5%` 后的平均绝对误差）不超过阈值；当前版本已关闭主方向竖直性门控。
+9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。
 
-视角权重使用角度权重（仅角度，不用距离）：
-
-\[
-w_{angle} = \max\left(0,\ 1 - \frac{|\alpha_{max}-90^\circ|}{90^\circ}\right)
-\]
 
 输出（每场景）：
-1. `fusion/{scene_name}_instance_seg.las`：只包含实例点，按场景内实例 ID 随机着色。
-2. `fusion/{scene_name}_instance_seg.npz`：包含实例 ID、类别、置信度、实例点索引，以及点级唯一归属结果。
-3. `fusion/{scene_name}_instance_seg_meta.json`：去噪/过滤统计日志。
+1. `fusion/{scene_name}_instance_seg.las`：当前 Task5 主流程输出，只包含实例点，按场景内实例 ID 随机着色。
+2. `fusion/{scene_name}_instance_seg_refined.las`：在主流程结果基础上，再经过地面点剔除和围栏重聚类后的 refined LAS。
+3. `fusion/{scene_name}_instance_seg_final.las`：在 refined 结果基础上，再经过树木树干/树冠后处理后的最终 LAS。
+4. `fusion/{scene_name}_instance_seg.npz`：主流程实例 ID、类别、置信度、实例点索引，以及点级唯一归属结果。
+5. `fusion/{scene_name}_instance_seg_final.npz`：最终树木后处理结果对应的实例点索引、类别和点级唯一归属结果。
+6. `fusion/{scene_name}_instance_seg_tree_trunks_height.las`：树干候选经过“稳健高度范围”过滤后的阶段 LAS。
+7. `fusion/{scene_name}_instance_seg_tree_trunks_radius.las`：在高度阶段基础上，再经过“水平稳健半径”过滤后的阶段 LAS。
+   以上 2 个 trunk LAS 都会写入额外字段：`trunk_height`、`trunk_radius`、`trunk_dir_x`、`trunk_dir_y`、`trunk_dir_z`、`trunk_dot_z`（以及 `cls_id`）。
+8. `fusion/{scene_name}_instance_seg_meta.json`：去噪/过滤统计日志。
+
+默认场景级跳过：
+- 若 `fusion/` 已存在且非空，且未启用 `--overwrite`，则直接跳过该场景。
 
 ```bash
 python ImgProject/pipeline/task5_scene_instance_seg.py \
@@ -192,7 +198,25 @@ python ImgProject/pipeline/task5_scene_instance_seg.py \
   --backproject-depth-threshold 0.20 \
   --min-merged-points 150 \
   --denoise-eps 0.60 \
-  --denoise-min-points 30
+  --denoise-min-points 30 \
+  --ground-z-quantile 0.10 \
+  --ground-support-height 0.50 \
+  --ground-bbox-expand 0.02 \
+  --ground-support-top-ratio 0.70 \
+  --fence-recluster-eps 0.20 \
+  --fence-min-cluster-points 500 \
+  --fence-min-height 0.50 \
+  --tree-trunk-band-min 0.80 \
+  --tree-trunk-band-max 1.40 \
+  --tree-trunk-dbscan-eps 0.20 \
+  --tree-trunk-dbscan-min-samples 3 \
+  --tree-trunk-min-points 10 \
+  --tree-trunk-min-height 0.30 \
+  --tree-trunk-max-radius 0.30 \
+  --tree-trunk-max-residual 0.08 \
+  --tree-trunk-min-verticality 0.55 \
+  --tree-crown-attach-distance 4.0 \
+  --save-tree-trunk-anchors
 ```
 
 
