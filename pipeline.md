@@ -77,7 +77,7 @@
 4. 同一 `.npz` 同时包含点级归属：
 `point_instance_id (N,int32)`, `point_confidence (N,float32)`。
 
-## 实施任务（可直接交给 AI 编码）
+## 实施任务
 
 ### 任务1：多场景发现与配置装载
 输入：`data_root/scene_*/source/*.las` 与同目录 `*_stations.json`。
