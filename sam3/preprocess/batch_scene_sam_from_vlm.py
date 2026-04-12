@@ -69,12 +69,30 @@ CLASS_TO_EN_PROMPT = {
 
 EN_TO_CLASS = {v.lower(): k for k, v in CLASS_TO_EN_PROMPT.items()}
 
+TASK4_ALL_CLASS_NAMES: tuple[str, ...] = (
+    "电线杆",
+    "路灯杆",
+    "路牌",
+    "交通标志",
+    "红绿灯",
+    "监控",
+    "行道树",
+    "果壳箱",
+    "消防栓",
+    "电箱",
+    "雕塑",
+    "座椅",
+    "交通锥",
+    "柱墩",
+    "围栏",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Task4: batch SAM inference by reading benchmark scenes and each image's "
-            "vlm_desc/*.vlm.txt class list."
+            "Task4: batch SAM inference for benchmark scenes. Default runs all 15 prompts "
+            "per image; use --no-use-all-classes to read vlm_desc/*.vlm.txt instead."
         )
     )
     parser.add_argument("--data-root", required=True, help="benchmark root")
@@ -92,6 +110,12 @@ def parse_args() -> argparse.Namespace:
         "--save-per-class-artifacts",
         action="store_true",
         help="Also save per-class npz and duplicate merged png under sam_mask/per_class",
+    )
+    parser.add_argument(
+        "--use-all-classes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ignore vlm_desc and run all 15 predefined prompts for each image.",
     )
     return parser.parse_args()
 
@@ -220,6 +244,10 @@ def parse_vlm_txt(vlm_txt_path: Path) -> list[tuple[str, str, float]]:
     return sorted(items, key=lambda x: x[0])
 
 
+def all_task4_classes() -> list[tuple[str, str, float]]:
+    return [(class_name, CLASS_TO_EN_PROMPT[class_name], 1.0) for class_name in TASK4_ALL_CLASS_NAMES]
+
+
 def save_empty_npz(
     npz_path: Path,
     image_path: Path,
@@ -277,6 +305,7 @@ def run_scene_batch(
     *,
     alpha: float,
     save_per_class_artifacts: bool,
+    use_all_classes: bool,
 ) -> dict[str, Any]:
     projected_images_dir = scene_dir / "projected_images"
     vlm_desc_dir = scene_dir / "vlm_desc"
@@ -295,14 +324,19 @@ def run_scene_batch(
             "vlm_txt": str(vlm_txt_path),
         }
 
-        classes = parse_vlm_txt(vlm_txt_path)
         unknown_vlm_classes: list[str] = []
         valid_classes: list[tuple[str, str, float]] = []
-        for class_name, class_prompt_en, class_conf in classes:
-            if class_name not in CLASS_TO_ID:
-                unknown_vlm_classes.append(f"{class_name}({class_prompt_en})")
-                continue
-            valid_classes.append((class_name, class_prompt_en, class_conf))
+        if use_all_classes:
+            valid_classes = all_task4_classes()
+            scene_row["class_source"] = "all_15_classes"
+        else:
+            classes = parse_vlm_txt(vlm_txt_path)
+            for class_name, class_prompt_en, class_conf in classes:
+                if class_name not in CLASS_TO_ID:
+                    unknown_vlm_classes.append(f"{class_name}({class_prompt_en})")
+                    continue
+                valid_classes.append((class_name, class_prompt_en, class_conf))
+            scene_row["class_source"] = "vlm_desc"
 
         if valid_classes:
             class_pairs = [f"{class_name}({class_prompt_en})" for class_name, class_prompt_en, _ in valid_classes]
@@ -310,7 +344,7 @@ def run_scene_batch(
         else:
             print(f"{image_path.name}: <no valid classes>")
 
-        if not classes:
+        if (not use_all_classes) and (not classes):
             save_empty_npz(
                 sam_mask_dir / f"{image_path.stem}.npz",
                 image_path,
@@ -493,6 +527,7 @@ def main() -> None:
             sam3_processor=processor,
             alpha=float(args.alpha),
             save_per_class_artifacts=bool(args.save_per_class_artifacts),
+            use_all_classes=bool(args.use_all_classes),
         )
         print(f"scene done: {scene_dir.name}")
     print("all done.")

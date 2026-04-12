@@ -22,6 +22,11 @@ from sklearn.cluster import DBSCAN
 
 from tqdm import tqdm
 
+try:
+    import CSF
+except Exception:
+    CSF = None
+
 CLASS_ID_TO_NAME: dict[int, str] = {
     1: "电线杆",
     2: "路灯杆",
@@ -48,9 +53,11 @@ TREE_CLASS_ID = 7
 
 FENCE_CLASS_ID = 15
 
-POLE_LIKE_CLASS_IDS = frozenset({1, 2, 3, 4, 5, 6})
+FULL_POLE_CLASS_IDS = frozenset({1, 2})
 
-GROUND_FILTER_CLASS_IDS = frozenset({1, 2, 3, 4, 8, 9, 11, 12, 13, 14, 15})
+SIGN_LIKE_CLASS_IDS = frozenset({3, 4, 5, 6})
+
+GROUND_FILTER_CLASS_IDS = frozenset({1, 2, 8, 9, 11, 12, 13, 14, 15})
 
 @dataclass
 class CandidateInstance:
@@ -313,7 +320,7 @@ def _classes_pass_merge_gate(class_id_a: int, class_id_b: int) -> bool:
         return False
     if class_id_a == class_id_b:
         return True
-    return class_id_a in POLE_LIKE_CLASS_IDS and class_id_b in POLE_LIKE_CLASS_IDS
+    return class_id_a in FULL_POLE_CLASS_IDS and class_id_b in FULL_POLE_CLASS_IDS
 
 def _candidate_xy_center_distance(a: CandidateInstance, b: CandidateInstance) -> float:
     center_a = np.asarray(a.xy_center, dtype=np.float32) if a.xy_center is not None else 0.5 * (a.bbox_min[:2] + a.bbox_max[:2])
@@ -323,9 +330,9 @@ def _candidate_xy_center_distance(a: CandidateInstance, b: CandidateInstance) ->
 def _supports_xy_supplementary_merge(class_id_a: int, class_id_b: int) -> bool:
     if class_id_a == 7 or class_id_b == 7:
         return False
-    if class_id_a in POLE_LIKE_CLASS_IDS and class_id_b in POLE_LIKE_CLASS_IDS:
+    if class_id_a == class_id_b and class_id_a in CLASS_ID_TO_NAME:
         return True
-    return class_id_a == class_id_b and class_id_a in CLASS_ID_TO_NAME
+    return class_id_a in FULL_POLE_CLASS_IDS and class_id_b in FULL_POLE_CLASS_IDS
 
 def _should_merge_candidates(
     a: CandidateInstance,
@@ -561,10 +568,25 @@ def _prune_tree_points_before_assignment(
     if not candidates or not instances or candidate_to_instance.size == 0:
         return 0
 
+    full_pole_instance_ids = {
+        inst_id for inst_id, inst in enumerate(instances) if inst.class_id in FULL_POLE_CLASS_IDS
+    }
+    sign_like_instance_ids = {
+        inst_id for inst_id, inst in enumerate(instances) if inst.class_id in SIGN_LIKE_CLASS_IDS
+    }
     tree_instance_ids = {inst_id for inst_id, inst in enumerate(instances) if inst.class_id == TREE_CLASS_ID}
-    if not tree_instance_ids:
-        return 0
     fence_instance_ids = {inst_id for inst_id, inst in enumerate(instances) if inst.class_id == FENCE_CLASS_ID}
+
+    sign_like_chunks = [
+        inst.point_indices.astype(np.int32, copy=False)
+        for inst_id, inst in enumerate(instances)
+        if inst_id in sign_like_instance_ids and inst.point_indices.size > 0
+    ]
+    sign_like_points = (
+        np.unique(np.concatenate(sign_like_chunks, axis=0)).astype(np.int32, copy=False)
+        if sign_like_chunks
+        else np.zeros((0,), dtype=np.int32)
+    )
 
     non_tree_chunks = [
         inst.point_indices.astype(np.int32, copy=False)
@@ -606,6 +628,13 @@ def _prune_tree_points_before_assignment(
             ]
 
     removed_total = 0
+    if sign_like_points.size > 0:
+        for inst_id in full_pole_instance_ids:
+            inst = instances[inst_id]
+            keep_mask = ~np.isin(inst.point_indices, sign_like_points, assume_unique=False)
+            removed_total += int(inst.point_indices.size - np.count_nonzero(keep_mask))
+            inst.point_indices = inst.point_indices[keep_mask].astype(np.int32, copy=False)
+
     if non_tree_points.size > 0:
         for inst_id in tree_instance_ids:
             inst = instances[inst_id]
@@ -626,6 +655,11 @@ def _prune_tree_points_before_assignment(
         if cand.point_indices.size == 0:
             continue
         inst_id = int(candidate_to_instance[cand_idx])
+        if inst_id < 0:
+            continue
+        if inst_id in full_pole_instance_ids and sign_like_points.size > 0:
+            keep_mask = ~np.isin(cand.point_indices, sign_like_points, assume_unique=False)
+            cand.point_indices = cand.point_indices[keep_mask].astype(np.int32, copy=False)
         if inst_id in tree_instance_ids and non_tree_points.size > 0:
             keep_mask = ~np.isin(cand.point_indices, non_tree_points, assume_unique=False)
             cand.point_indices = cand.point_indices[keep_mask].astype(np.int32, copy=False)
@@ -649,16 +683,20 @@ def _ground_bbox_keep_mask(
 
     q = min(1.0, max(0.0, float(ground_quantile)))
     z = points_xyz[:, 2]
-    z_ground = float(np.quantile(z, q))
-    lower_height = z_ground + float(support_height)
-    z_top = float(np.quantile(z, 0.95))
-    span = max(0.0, z_top - z_ground)
+    z_low = float(np.quantile(z, q))
+    z_high = float(np.quantile(z, 0.95))
+    span = max(0.0, z_high - z_low)
+    if not np.isfinite(span) or span <= 1e-6:
+        return np.ones((n,), dtype=bool)
+
+    low_ratio = min(1.0, max(0.0, float(support_height)))
     top_ratio = min(1.0, max(0.0, float(support_top_ratio)))
-    upper_height = z_ground + top_ratio * span
+    lower_height = z_low + low_ratio * span
+    upper_height = z_low + top_ratio * span
     if upper_height <= lower_height:
         support_mask = z > lower_height
     else:
-        support_mask = (z > lower_height) & (z <= upper_height)
+        support_mask = (z >= lower_height) & (z <= upper_height)
         if not np.any(support_mask):
             support_mask = z > lower_height
     if not np.any(support_mask):
@@ -669,8 +707,57 @@ def _ground_bbox_keep_mask(
     bbox_max = support_xy.max(axis=0) + float(bbox_expand)
     xy = points_xyz[:, :2]
     inside_bbox = np.all((xy >= bbox_min) & (xy <= bbox_max), axis=1)
-    low_ground = points_xyz[:, 2] <= (z_ground + float(support_height))
+    low_ground = points_xyz[:, 2] <= lower_height
     return inside_bbox | (~low_ground)
+
+
+def _fence_instance_csf_ground_mask(
+    points_xyz: np.ndarray,
+    *,
+    cloth_resolution: float = 1.0,
+    rigidness: int = 1,
+    time_step: float = 0.65,
+    class_threshold: float = 1.2,
+    iterations: int = 800,
+    slope_smooth: bool = True,
+) -> np.ndarray | None:
+    """
+    Return per-point ground mask for one fence instance with CSF.
+    Returns None when CSF is unavailable or fails.
+    """
+    if CSF is None:
+        return None
+    n = int(points_xyz.shape[0])
+    if n == 0:
+        return np.zeros((0,), dtype=bool)
+
+    try:
+        mins = points_xyz.min(axis=0)
+        maxs = points_xyz.max(axis=0)
+        center = (mins + maxs) / 2.0
+        centered = points_xyz - center
+
+        csf = CSF.CSF()
+        csf.setPointCloud(centered.astype(np.float64, copy=False))
+        csf.params.cloth_resolution = float(cloth_resolution)
+        csf.params.rigidness = int(rigidness)
+        csf.params.time_step = float(time_step)
+        csf.params.class_threshold = float(class_threshold)
+        csf.params.interations = int(iterations)
+        csf.params.bSloopSmooth = bool(slope_smooth)
+
+        ground = CSF.VecInt()
+        non_ground = CSF.VecInt()
+        csf.do_filtering(ground, non_ground)
+    except Exception:
+        return None
+
+    mask = np.zeros((n,), dtype=bool)
+    for idx in ground:
+        idx_int = int(idx)
+        if 0 <= idx_int < n:
+            mask[idx_int] = True
+    return mask
 
 def _cluster_point_indices(
     points_xyz: np.ndarray,
@@ -726,6 +813,49 @@ def _tree_ground_z_from_effective_stations(projected_dir: Path) -> float | None:
         if extrinsic.shape == (4, 4) and np.isfinite(extrinsic[2, 3]):
             return float(extrinsic[2, 3] - 2.0)
     return None
+
+
+def _tree_station_ground_refs_from_effective_stations(projected_dir: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Build per-station XY + ground-z references from effective_stations.json.
+    Each station ref is aggregated (median) from all valid camera extrinsics in that station.
+    Returns:
+      station_xy: (N, 2) float32
+      station_ground_z: (N,) float32 where ground_z = station_z - 2.0
+    """
+    stations = _load_effective_stations(projected_dir)
+    if not stations:
+        return None
+
+    xy_list: list[np.ndarray] = []
+    gz_list: list[float] = []
+    for station in stations:
+        if not isinstance(station, dict):
+            continue
+        t_list: list[np.ndarray] = []
+        for value in station.values():
+            try:
+                extrinsic = np.asarray(value, dtype=np.float32)
+            except Exception:
+                continue
+            if extrinsic.shape != (4, 4):
+                continue
+            t = extrinsic[:3, 3].astype(np.float32, copy=False)
+            if np.all(np.isfinite(t)):
+                t_list.append(t)
+        if not t_list:
+            continue
+        t_stack = np.stack(t_list, axis=0)
+        t_median = np.median(t_stack, axis=0).astype(np.float32, copy=False)
+        xy_list.append(t_median[:2].astype(np.float32, copy=False))
+        gz_list.append(float(t_median[2] - 2.0))
+
+    if not xy_list:
+        return None
+
+    station_xy = np.stack(xy_list, axis=0).astype(np.float32, copy=False)
+    station_ground_z = np.asarray(gz_list, dtype=np.float32).reshape(-1)
+    return station_xy, station_ground_z
 
 def _robust_xy_radius(points_xyz: np.ndarray) -> float:
     if points_xyz.size == 0:
@@ -875,6 +1005,13 @@ def _refine_instances_with_ground_and_fence(
     fence_min_cluster_points: int,
     fence_min_height: float,
     fence_dbscan_min_samples: int = 1,
+    fence_csf_enable: bool = True,
+    fence_csf_cloth_resolution: float = 1.0,
+    fence_csf_rigidness: int = 1,
+    fence_csf_time_step: float = 0.65,
+    fence_csf_class_threshold: float = 1.2,
+    fence_csf_iterations: int = 800,
+    fence_csf_slope_smooth: bool = True,
 ) -> tuple[list[SceneInstance], np.ndarray, dict[str, int]]:
     refined_instances: list[SceneInstance] = []
     refined_point_instance_id = np.full(point_instance_id.shape, -1, dtype=np.int32)
@@ -889,25 +1026,25 @@ def _refine_instances_with_ground_and_fence(
         if pts.size == 0:
             continue
 
-        refined_pts = pts
-        if inst.class_id in GROUND_FILTER_CLASS_IDS:
-            keep_mask = _ground_bbox_keep_mask(
-                points_xyz[pts],
-                ground_quantile=ground_quantile,
-                support_height=support_height,
-                bbox_expand=bbox_expand,
-                support_top_ratio=support_top_ratio,
-            )
-            ground_removed_total += int(pts.size - np.count_nonzero(keep_mask))
-            refined_pts = pts[keep_mask].astype(np.int32, copy=False)
-
-        if refined_pts.size == 0:
-            continue
-
         if inst.class_id == 15:
-            fence_point_chunks.append(refined_pts)
+            # Fence instances skip bbox-based ground removal and rely on CSF only.
+            fence_point_chunks.append(pts)
             fence_score_chunks.append(inst.class_scores.astype(np.float32, copy=False))
             fence_confidences.append(float(inst.class_confidence))
+            continue
+
+        refined_pts = pts
+        keep_mask = _ground_bbox_keep_mask(
+            points_xyz[pts],
+            ground_quantile=ground_quantile,
+            support_height=support_height,
+            bbox_expand=bbox_expand,
+            support_top_ratio=support_top_ratio,
+        )
+        ground_removed_total += int(pts.size - np.count_nonzero(keep_mask))
+        refined_pts = pts[keep_mask].astype(np.int32, copy=False)
+
+        if refined_pts.size == 0:
             continue
 
         refined_instances.append(
@@ -923,8 +1060,44 @@ def _refine_instances_with_ground_and_fence(
     fence_instances_after = 0
     fence_clusters_filtered_small = 0
     fence_clusters_filtered_low_height = 0
+    fence_csf_instances_applied = 0
+    fence_csf_instances_unavailable = 0
+    fence_csf_all_ground_instances = 0
+    fence_csf_removed_points_total = 0
     if fence_point_chunks:
-        fence_points = np.unique(np.concatenate(fence_point_chunks, axis=0)).astype(np.int32, copy=False)
+        fence_point_chunks_after_csf: list[np.ndarray] = []
+        for chunk in fence_point_chunks:
+            refined_chunk = chunk.astype(np.int32, copy=False)
+            if bool(fence_csf_enable) and refined_chunk.size > 0:
+                local_points = points_xyz[refined_chunk]
+                ground_mask = _fence_instance_csf_ground_mask(
+                    local_points,
+                    cloth_resolution=float(fence_csf_cloth_resolution),
+                    rigidness=int(fence_csf_rigidness),
+                    time_step=float(fence_csf_time_step),
+                    class_threshold=float(fence_csf_class_threshold),
+                    iterations=int(fence_csf_iterations),
+                    slope_smooth=bool(fence_csf_slope_smooth),
+                )
+                if ground_mask is None:
+                    fence_csf_instances_unavailable += 1
+                elif ground_mask.shape[0] == refined_chunk.shape[0]:
+                    fence_csf_instances_applied += 1
+                    keep_mask = ~ground_mask
+                    kept = int(np.count_nonzero(keep_mask))
+                    if kept > 0:
+                        fence_csf_removed_points_total += int(refined_chunk.size - kept)
+                        refined_chunk = refined_chunk[keep_mask].astype(np.int32, copy=False)
+                    else:
+                        # Guardrail: keep original chunk when CSF marks all points as ground.
+                        fence_csf_all_ground_instances += 1
+            if refined_chunk.size > 0:
+                fence_point_chunks_after_csf.append(refined_chunk.astype(np.int32, copy=False))
+
+        if not fence_point_chunks_after_csf:
+            fence_point_chunks_after_csf = fence_point_chunks
+
+        fence_points = np.unique(np.concatenate(fence_point_chunks_after_csf, axis=0)).astype(np.int32, copy=False)
         fence_clusters = _cluster_point_indices(
             points_xyz,
             fence_points,
@@ -972,6 +1145,10 @@ def _refine_instances_with_ground_and_fence(
         "fence_instances_after": int(fence_instances_after),
         "fence_clusters_filtered_small": int(fence_clusters_filtered_small),
         "fence_clusters_filtered_low_height": int(fence_clusters_filtered_low_height),
+        "fence_csf_instances_applied": int(fence_csf_instances_applied),
+        "fence_csf_instances_unavailable": int(fence_csf_instances_unavailable),
+        "fence_csf_all_ground_instances": int(fence_csf_all_ground_instances),
+        "fence_csf_removed_points_total": int(fence_csf_removed_points_total),
     }
     return refined_instances, refined_point_instance_id, stats
 
@@ -1336,6 +1513,8 @@ def _refine_tree_instances(
     instances: list[SceneInstance],
     *,
     tree_ground_z: float | None,
+    tree_station_xy: np.ndarray | None = None,
+    tree_station_ground_z: np.ndarray | None = None,
     trunk_band_min: float,
     trunk_band_max: float,
     trunk_dbscan_eps: float,
@@ -1343,9 +1522,11 @@ def _refine_tree_instances(
     trunk_min_points: int,
     trunk_min_height: float,
     trunk_max_radius: float,
-    trunk_max_residual: float,
     trunk_min_verticality: float,
     crown_attach_distance: float,
+    trunk_max_residual: float = 0.08,
+    trunk_height_band_min: float | None = None,
+    trunk_height_band_max: float | None = None,
     return_trunk_stage_clusters: bool = False,
 ) -> tuple[list[SceneInstance], np.ndarray, dict[str, int]] | tuple[list[SceneInstance], np.ndarray, dict[str, int], dict[str, list[dict[str, Any]]]]:
     copied_instances = [_copy_scene_instance(inst) for inst in instances]
@@ -1368,20 +1549,68 @@ def _refine_tree_instances(
         return empty_instances, empty_point_instance_id, empty_stats
 
     non_tree_instances = [_copy_scene_instance(inst) for inst in copied_instances if inst.class_id != TREE_CLASS_ID]
+    station_xy_arr: np.ndarray | None = None
+    station_ground_arr: np.ndarray | None = None
+    if tree_station_xy is not None and tree_station_ground_z is not None:
+        try:
+            xy_arr = np.asarray(tree_station_xy, dtype=np.float32).reshape(-1, 2)
+            gz_arr = np.asarray(tree_station_ground_z, dtype=np.float32).reshape(-1)
+            if xy_arr.shape[0] > 0 and xy_arr.shape[0] == gz_arr.shape[0]:
+                finite_xy = np.all(np.isfinite(xy_arr), axis=1)
+                finite_gz = np.isfinite(gz_arr)
+                valid = finite_xy & finite_gz
+                if np.any(valid):
+                    station_xy_arr = xy_arr[valid].astype(np.float32, copy=False)
+                    station_ground_arr = gz_arr[valid].astype(np.float32, copy=False)
+        except Exception:
+            station_xy_arr = None
+            station_ground_arr = None
+    has_station_ground_refs = (
+        station_xy_arr is not None
+        and station_ground_arr is not None
+        and station_xy_arr.shape[0] > 0
+        and station_ground_arr.shape[0] == station_xy_arr.shape[0]
+    )
+    has_any_tree_ground_ref = bool(tree_ground_z is not None) or has_station_ground_refs
+
+    radius_band_low = min(float(trunk_band_min), float(trunk_band_max))
+    radius_band_high = max(float(trunk_band_min), float(trunk_band_max))
+    height_band_min = radius_band_low if trunk_height_band_min is None else float(trunk_height_band_min)
+    height_band_max = radius_band_high if trunk_height_band_max is None else float(trunk_height_band_max)
+    height_band_low = min(height_band_min, height_band_max)
+    height_band_high = max(height_band_min, height_band_max)
     tree_infos: list[dict[str, Any]] = []
     for inst in copied_instances:
         if inst.class_id != TREE_CLASS_ID:
             continue
         point_indices = np.unique(np.asarray(inst.point_indices, dtype=np.int32))
-        band_points = np.zeros((0,), dtype=np.int32)
-        if tree_ground_z is not None and point_indices.size > 0:
+        radius_band_points = np.zeros((0,), dtype=np.int32)
+        height_band_points = np.zeros((0,), dtype=np.int32)
+        local_tree_ground_z = tree_ground_z
+        if has_station_ground_refs and point_indices.size > 0:
+            tree_xy_center = points_xyz[point_indices, :2].mean(axis=0)
+            dists = np.linalg.norm(station_xy_arr - tree_xy_center[None, :], axis=1)
+            nearest_idx = int(np.argmin(dists))
+            nearest_ground_z = float(station_ground_arr[nearest_idx])
+            if np.isfinite(nearest_ground_z):
+                local_tree_ground_z = nearest_ground_z
+        if local_tree_ground_z is not None and point_indices.size > 0:
             z = points_xyz[point_indices, 2]
-            band_mask = (z >= float(tree_ground_z) + float(trunk_band_min)) & (z <= float(tree_ground_z) + float(trunk_band_max))
-            band_points = point_indices[band_mask].astype(np.int32, copy=False)
-        tree_infos.append({'instance': _copy_scene_instance(inst), 'point_indices': point_indices, 'band_points': band_points})
+            radius_mask = (z >= float(local_tree_ground_z) + radius_band_low) & (z <= float(local_tree_ground_z) + radius_band_high)
+            height_mask = (z >= float(local_tree_ground_z) + height_band_low) & (z <= float(local_tree_ground_z) + height_band_high)
+            radius_band_points = point_indices[radius_mask].astype(np.int32, copy=False)
+            height_band_points = point_indices[height_mask].astype(np.int32, copy=False)
+        tree_infos.append(
+            {
+                'instance': _copy_scene_instance(inst),
+                'point_indices': point_indices,
+                'radius_band_points': radius_band_points,
+                'height_band_points': height_band_points,
+            }
+        )
 
     tree_instances_before = len(tree_infos)
-    if tree_ground_z is None or tree_instances_before == 0:
+    if (not has_any_tree_ground_ref) or tree_instances_before == 0:
         final_instances = non_tree_instances + [_copy_scene_instance(info['instance']) for info in tree_infos]
         stats = dict(empty_stats)
         stats['tree_instances_before'] = int(tree_instances_before)
@@ -1391,7 +1620,7 @@ def _refine_tree_instances(
             return final_instances, final_point_instance_id, stats, empty_stage
         return final_instances, final_point_instance_id, stats
 
-    band_chunks = [info['band_points'] for info in tree_infos if info['band_points'].size > 0]
+    band_chunks = [info['radius_band_points'] for info in tree_infos if info['radius_band_points'].size > 0]
     if not band_chunks:
         final_instances = non_tree_instances
         stats = dict(empty_stats)
@@ -1405,6 +1634,15 @@ def _refine_tree_instances(
         return final_instances, final_point_instance_id, stats
 
     all_band_points = np.unique(np.concatenate(band_chunks, axis=0)).astype(np.int32, copy=False)
+    # Map each radius-band point to its source tree instance so height补点 can be limited
+    # to the tree instances that actually contribute to the merged trunk candidate cluster.
+    radius_point_to_tree_info: dict[int, int] = {}
+    for info_idx, info in enumerate(tree_infos):
+        radius_points = np.asarray(info['radius_band_points'], dtype=np.int32).reshape(-1)
+        for point_idx in radius_points.astype(np.int64, copy=False):
+            radius_point_to_tree_info[int(point_idx)] = int(info_idx)
+    height_link_radius = 0.05
+
     candidate_clusters = _cluster_point_indices(
         points_xyz,
         all_band_points,
@@ -1423,7 +1661,34 @@ def _refine_tree_instances(
         if cluster.size < min_trunk_points:
             continue
         cluster_xyz = points_xyz[cluster]
-        robust_height = _robust_height_range(cluster_xyz)
+        height_metric_points = cluster
+        contributing_tree_info_ids = sorted(
+            {
+                radius_point_to_tree_info[int(point_idx)]
+                for point_idx in cluster.astype(np.int64, copy=False)
+                if int(point_idx) in radius_point_to_tree_info
+            }
+        )
+        if contributing_tree_info_ids:
+            local_height_chunks = [
+                np.asarray(tree_infos[info_idx]['height_band_points'], dtype=np.int32).reshape(-1)
+                for info_idx in contributing_tree_info_ids
+                if np.asarray(tree_infos[info_idx]['height_band_points']).size > 0
+            ]
+            if local_height_chunks:
+                local_height_points = np.unique(np.concatenate(local_height_chunks, axis=0)).astype(np.int32, copy=False)
+                if local_height_points.size > 0:
+                    local_height_tree = cKDTree(points_xyz[local_height_points, :2])
+                    neighbor_lists = local_height_tree.query_ball_point(cluster_xyz[:, :2], r=height_link_radius)
+                    matched_lists = [np.asarray(neighbors, dtype=np.int32) for neighbors in neighbor_lists if len(neighbors) > 0]
+                    if matched_lists:
+                        matched_local_idx = np.unique(np.concatenate(matched_lists, axis=0)).astype(np.int64, copy=False)
+                        matched_points = local_height_points[matched_local_idx]
+                        if matched_points.size > 0:
+                            height_metric_points = np.unique(matched_points.astype(np.int32, copy=False))
+        height_points_xyz = points_xyz[height_metric_points]
+        z_vals = np.asarray(height_points_xyz[:, 2], dtype=np.float32)
+        robust_height = float(z_vals.max() - z_vals.min()) if z_vals.size > 0 else 0.0
         robust_radius, radius_residual = _taubin_radius_and_trimmed_residual(cluster_xyz, trim_ratio=0.05)
         principal_direction = _principal_direction(cluster_xyz)
         dot_z = float(principal_direction[2])
@@ -1433,6 +1698,7 @@ def _refine_tree_instances(
                 'point_indices': np.unique(cluster.astype(np.int32, copy=False)),
                 'xy_center': cluster_xyz[:, :2].mean(axis=0).astype(np.float32, copy=False),
                 'robust_height': float(robust_height),
+                'height_metric_points': int(height_metric_points.size),
                 'robust_radius': float(robust_radius),
                 'radius_residual': float(radius_residual),
                 'principal_direction': principal_direction.astype(np.float32, copy=False),
@@ -1472,7 +1738,7 @@ def _refine_tree_instances(
 
     for info in tree_infos:
         point_indices = info['point_indices']
-        band_points = info['band_points']
+        band_points = info['radius_band_points']
         if not anchors or band_points.size == 0:
             pending_infos.append(info)
             continue
@@ -1571,4 +1837,3 @@ def _refine_tree_instances(
     if return_trunk_stage_clusters:
         return final_instances, final_point_instance_id, stats, stage_clusters
     return final_instances, final_point_instance_id, stats
-

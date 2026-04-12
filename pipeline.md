@@ -77,7 +77,7 @@
 4. 同一 `.npz` 同时包含点级归属：
 `point_instance_id (N,int32)`, `point_confidence (N,float32)`。
 
-## 实施任务（可直接交给 AI 编码）
+## 实施任务
 
 ### 任务1：多场景发现与配置装载
 输入：`data_root/scene_*/source/*.las` 与同目录 `*_stations.json`。
@@ -123,8 +123,9 @@
 # Qwen3-VL
 python Qwen3-VL/infer/batch_scene_classify.py \
   --data-root benchmark \
-  --model-path Qwen/Qwen3-VL-8B-Thinking \
-  --max-new-tokens 512
+  --model-path Qwen/Qwen3-VL-2B-Thinking \
+  --max-new-tokens 1024 \
+  --use-coarse-classes
 
 # GLM-V
 python GLM-V/inference/batch_scene_classify_glm.py \
@@ -136,7 +137,9 @@ python GLM-V/inference/batch_scene_classify_glm.py \
 ### 任务4：SAM 批处理接入
 输入：
 1. 待推理图像（来自 `projected_images`）。
-2. 每图命中类别（来自 `.vlm.txt`）。
+2. 类别来源可二选一：
+   - 默认：每图固定 15 类文本全部推理（`--use-all-classes`）。
+   - 可选：仅使用 `.vlm.txt` 命中类别（`--no-use-all-classes`）。
 3. 你的 SAM 推理代码（输出单个 `.npz`，含 `masks/boxes/scores`）。
 输出：`sam_mask/{img_stem}.npz`。
 要求：
@@ -149,10 +152,13 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
   --checkpoint sam3/model/sam3.pt \
   --device cuda \
   --sam-resolution 1008 \
-  --confidence-threshold 0
+  --confidence-threshold 0.3 \
+  --use-all-classes
 
 # 如需额外按类别保存单独结果（便于排查）
 # python sam3/preprocess/batch_scene_sam_from_vlm.py --data-root benchmark --save-per-class-artifacts
+# 如需回退为“仅使用 vlm_desc 命中类别”模式
+# python sam3/preprocess/batch_scene_sam_from_vlm.py --data-root benchmark --no-use-all-classes
 ```
 
 ### 任务5：2D->3D 回投 + IoU合并 + 点冲突归属 + 去噪
@@ -164,13 +170,13 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 
 处理：
 1. 将每个 2D mask 通过 `pts_img_indices -> pts_indices` 回投到 3D 点索引集合；回投时基于 `effective_stations.json` 计算候选点的相机前向深度，仅保留落在当前像素前景深度 `+0.2m` 范围内的点，形成 scene-level 候选实例。
-2. 候选实例先做类别门控：同原类别允许合并；`1-6` 视为“杆状物大类”，彼此允许合并；`7 行道树` 仅与 `7 行道树` 合并；其他跨类组合暂不合并。在类别门控通过后，使用双通道合并：主通道为 `point IoU >= threshold`；补充通道用于 `1-6` 杆状物大类，以及 `8-15` 的同类实例，为 `XY` 中心距离足够小；树木暂不启用该补充通道，先保持当前 `IoU` 合并强度。候选合并后，若 merged instance 点数小于 `min-merged-points`，则直接丢弃，不进入后续处理。
-3. 对保留下来的 merged instance，先按 `w_angle * confidence` 累加类别得分，确定最终类别；点归属前执行“非树优先，树删点”。若某点同时属于树和围栏，则保留树点并从围栏侧剔除；若某点同时属于树实例和其他非树实例，则保留在非树实例中，并从树实例候选点中剔除。
+2. 候选实例先做类别门控：同原类别允许合并；仅 `1 电线杆` 与 `2 路灯杆` 允许跨类合并；`3-6`（路牌/交通标志/红绿灯/监控）仅同类合并；`7 行道树` 仅与 `7 行道树` 合并；`8-15` 其余类别仅同类合并。在类别门控通过后，使用双通道合并：主通道为 `point IoU >= threshold`；补充通道用于“同类实例”以及 `1<->2` 组合（`XY` 中心距离足够小）；树木暂不启用该补充通道，先保持当前 `IoU` 合并强度。候选合并后，若 merged instance 点数小于 `min-merged-points`，则直接丢弃，不进入后续处理。
+3. 对保留下来的 merged instance，先按 `w_angle * confidence` 累加类别得分，确定最终类别；点归属前执行冲突删点：若某点同时属于 `1/2` 与 `3/4/5/6`，优先保留 `3/4/5/6` 并从 `1/2` 删除；若某点同时属于树和围栏，则保留树点并从围栏侧剔除；若某点同时属于树实例和其他非树实例，则保留在非树实例中，并从树实例候选点中剔除。
 4. 点级冲突归属：同一点属于多个实例时，按加权总分取最大实例。
 5. 空间去噪：每实例做空间聚类，仅保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。
-6. 地面点剔除：仅对 `1, 2, 3, 4, 8, 9, 11, 12, 13, 14, 15` 这 `11` 类执行。按实例点云 `z` 值的 `10%` 分位数估计地面高度 `z_ground`，按 `95%` 分位数估计稳健顶部高度；仅使用位于中低高度带（`z > z_ground + 0.50m` 且 `z <= z_ground + 0.70 * (q95(z)-z_ground)`）的支撑点计算水平 `bbox`，向外扩 `2cm`，最后仅删除该 `bbox` 外的低矮地面点。
-7. 围栏重聚类：围栏实例先完成地面点剔除，再把所有 `class_id=15` 的点合并后按 `XY` 连通重新聚类；仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
-8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 读取首个站点高度，并用 `station_z - 2.0m` 估计树木搜索地面；将所有树实例中离地 `0.8-1.4m` 的高度带点汇总，在 `XY` 平面执行 DBSCAN 生成树干候选簇。候选簇需满足点数不少于 `50`、稳健高度范围 `q95(z)-q05(z) > 0.4m`；随后做 TaubinSVD 圆拟合，先判断拟合半径 `r_fit` 小于阈值，再判断径向残差（去掉前后 `5%` 后的平均绝对误差）不超过阈值；当前版本已关闭主方向竖直性门控。
+6. 地面点剔除（非围栏）：对除围栏外的类别执行。按实例点云 `z` 值计算 `z_low = q05(z)` 与 `z_high = q95(z)`，并使用相对高度带 `[z_low + 0.2*(z_high-z_low), z_low + 0.8*(z_high-z_low)]` 的支撑点计算水平 `bbox`，向外扩 `2cm`。最终采用保守剔除：仅删除“低高度带（`z <= z_low + 0.2*(z_high-z_low)`）且位于 `bbox` 外”的点。
+7. 围栏重聚类：围栏实例不做上述 bbox 地面点剔除；在重聚类前，对每个 `class_id=15` 围栏实例单独执行一次 CSF 去地面（实例级，默认开启），再把所有围栏非地面点合并后按 `XY` 连通重新聚类；仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
+8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 提取各 station 的位置与高度；对每棵树按 `XY` 质心匹配最近 station，并用该站点 `station_z - 2.0m` 作为该树的地面参考（station 信息异常时回退到全局默认值）。随后将所有树实例中离地 `0.8-1.4m` 的高度带点汇总，在 `XY` 平面执行 DBSCAN 生成树干候选簇。半径仍按该 `0.8-1.4m` 候选簇做 TaubinSVD 圆拟合（半径+残差门控）；高度改为从独立高度带（例如 `0.8-1.8m`）中补点，但补点范围仅限于“参与该候选树干簇合并的树实例”内部，且补点 `XY` 邻域半径固定为 `0.05m`；高度判定直接使用 `z_max - z_min`，并要求其大于 `tree-trunk-min-height`。当前版本已关闭主方向竖直性门控。
 9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。
 
 
@@ -191,30 +197,32 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 ```bash
 python ImgProject/pipeline/task5_scene_instance_seg.py \
   --data-root benchmark \
-  --iou-threshold 0.30 \
-  --merge-xy-distance 0.50 \
+  --iou-threshold 0.25 \
+  --merge-xy-distance 0.3 \
   --fov-deg 90 \
-  --min-mask-points 20 \
-  --backproject-depth-threshold 0.20 \
-  --min-merged-points 150 \
-  --denoise-eps 0.60 \
-  --denoise-min-points 30 \
-  --ground-z-quantile 0.10 \
-  --ground-support-height 0.50 \
+  --min-mask-points 100 \
+  --min-merged-points 500 \
+  --denoise-eps 0.25 \
+  --denoise-min-points 500 \
+  --denoise-dbscan-min-samples 5 \
+  --ground-z-quantile 0.05 \
+  --ground-support-height 0.20 \
   --ground-bbox-expand 0.02 \
-  --ground-support-top-ratio 0.70 \
-  --fence-recluster-eps 0.20 \
+  --ground-support-top-ratio 0.80 \
+  --fence-recluster-eps 0.10 \
   --fence-min-cluster-points 500 \
   --fence-min-height 0.50 \
+  --fence-dbscan-min-samples 5 \
   --tree-trunk-band-min 0.80 \
   --tree-trunk-band-max 1.40 \
-  --tree-trunk-dbscan-eps 0.20 \
-  --tree-trunk-dbscan-min-samples 3 \
-  --tree-trunk-min-points 10 \
-  --tree-trunk-min-height 0.30 \
+  --tree-trunk-height-band-min 0.80 \
+  --tree-trunk-height-band-max 1.80 \
+  --tree-trunk-dbscan-eps 0.05 \
+  --tree-trunk-dbscan-min-samples 10 \
+  --tree-trunk-min-points 50 \
+  --tree-trunk-min-height 0.50 \
   --tree-trunk-max-radius 0.30 \
-  --tree-trunk-max-residual 0.08 \
-  --tree-trunk-min-verticality 0.55 \
+  --tree-trunk-max-residual 0.04 \
   --tree-crown-attach-distance 4.0 \
   --save-tree-trunk-anchors
 ```
@@ -240,7 +248,10 @@ python ImgProject/pipeline/task8_cross_scene_merge.py \
 ```
 
 ## 假设与默认值
-1. VLM 固定使用 Qwen3VL。
+1. VLM 固定使用 GLM。
 2. SAM 输出固定为每图一个 `.npz`，且可直接读取 `masks/boxes/scores`。
 3. 多场景 LAS 在同一坐标系下，可直接进行跨场景空间计算。
 4. 合并与聚类阈值统一放到配置中可调。
+
+## 围栏 CSF 备选方案（后续）
+若实例级 CSF 在遮挡严重场景下仍不足以去掉“地面桥接”，后续可切换为“场景级全局 CSF”：每场景先跑一次全局地面分割，再在围栏分支按全局 ground mask 删除地面点，再做围栏重聚类。该方案通常更稳定，但计算开销更高。

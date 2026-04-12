@@ -90,14 +90,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ground-z-quantile",
         type=float,
-        default=0.10,
-        help="Quantile used to estimate per-instance ground height for non-tree classes.",
+        default=0.05,
+        help="Lower quantile used as z_low in relative-height support band construction for all classes.",
     )
     parser.add_argument(
         "--ground-support-height",
         type=float,
-        default=0.50,
-        help="Points above ground height plus this margin define the horizontal support bbox.",
+        default=0.20,
+        help="Relative low-band ratio for support bbox (z_low + ratio * (q95 - z_low)).",
     )
     parser.add_argument(
         "--ground-bbox-expand",
@@ -108,8 +108,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ground-support-top-ratio",
         type=float,
-        default=0.70,
-        help="Use only the mid-lower support band up to this fraction of the robust object height when building the ground-removal support bbox.",
+        default=0.80,
+        help="Relative high-band ratio for support bbox (z_low + ratio * (q95 - z_low)).",
     )
     parser.add_argument(
         "--fence-recluster-eps",
@@ -136,16 +136,70 @@ def parse_args() -> argparse.Namespace:
         help="DBSCAN min_samples used when re-clustering fence points.",
     )
     parser.add_argument(
+        "--fence-csf-enable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run per-fence-instance CSF ground filtering before fence re-clustering.",
+    )
+    parser.add_argument(
+        "--fence-csf-cloth-resolution",
+        type=float,
+        default=1.0,
+        help="CSF cloth resolution for fence pre-filtering.",
+    )
+    parser.add_argument(
+        "--fence-csf-rigidness",
+        type=int,
+        default=1,
+        help="CSF rigidness for fence pre-filtering (1-3).",
+    )
+    parser.add_argument(
+        "--fence-csf-time-step",
+        type=float,
+        default=0.65,
+        help="CSF time step for fence pre-filtering.",
+    )
+    parser.add_argument(
+        "--fence-csf-class-threshold",
+        type=float,
+        default=1.2,
+        help="CSF class threshold for fence pre-filtering.",
+    )
+    parser.add_argument(
+        "--fence-csf-iterations",
+        type=int,
+        default=800,
+        help="CSF iteration count for fence pre-filtering.",
+    )
+    parser.add_argument(
+        "--fence-csf-slope-smooth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable CSF slope smoothing for fence pre-filtering.",
+    )
+    parser.add_argument(
         "--tree-trunk-band-min",
         type=float,
         default=0.80,
-        help="Lower height above ground used for tree trunk candidate points.",
+        help="Lower height above ground used for trunk radius-band candidate points.",
     )
     parser.add_argument(
         "--tree-trunk-band-max",
         type=float,
         default=1.40,
-        help="Upper height above ground used for tree trunk candidate points.",
+        help="Upper height above ground used for trunk radius-band candidate points.",
+    )
+    parser.add_argument(
+        "--tree-trunk-height-band-min",
+        type=float,
+        default=0.80,
+        help="Lower height above ground used when computing robust trunk height (can differ from radius band).",
+    )
+    parser.add_argument(
+        "--tree-trunk-height-band-max",
+        type=float,
+        default=1.80,
+        help="Upper height above ground used when computing robust trunk height (can differ from radius band).",
     )
     parser.add_argument(
         "--tree-trunk-dbscan-eps",
@@ -181,7 +235,7 @@ def parse_args() -> argparse.Namespace:
         "--tree-trunk-max-residual",
         type=float,
         default=0.08,
-        help="Maximum 5%-trimmed mean absolute radial residual (meters) allowed after trunk circle fitting.",
+        help="Maximum 5 percent-trimmed mean absolute radial residual (meters) allowed after trunk circle fitting.",
     )
     parser.add_argument(
         "--tree-trunk-min-verticality",
@@ -289,8 +343,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         min_merged_points=int(args.min_merged_points),
     )
     print(_format_iou_merge_log(scene_name, candidate_count=len(candidates), merged_count=len(instances)))
-    tree_pruned_points = _prune_tree_points_before_assignment(candidates, candidate_to_instance, instances)
-    print(f"[{scene_name}] tree overlap pruning: removed_points={tree_pruned_points}")
+    preassign_pruned_points = _prune_tree_points_before_assignment(candidates, candidate_to_instance, instances)
+    print(f"[{scene_name}] pre-assignment overlap pruning: removed_points={preassign_pruned_points}")
     point_instance_id, point_confidence = assign_points(
         candidates,
         candidate_to_instance,
@@ -345,6 +399,13 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         fence_min_cluster_points=int(args.fence_min_cluster_points),
         fence_min_height=float(args.fence_min_height),
         fence_dbscan_min_samples=int(getattr(args, "fence_dbscan_min_samples", 5)),
+        fence_csf_enable=bool(getattr(args, "fence_csf_enable", True)),
+        fence_csf_cloth_resolution=float(getattr(args, "fence_csf_cloth_resolution", 1.0)),
+        fence_csf_rigidness=int(getattr(args, "fence_csf_rigidness", 1)),
+        fence_csf_time_step=float(getattr(args, "fence_csf_time_step", 0.65)),
+        fence_csf_class_threshold=float(getattr(args, "fence_csf_class_threshold", 1.2)),
+        fence_csf_iterations=int(getattr(args, "fence_csf_iterations", 800)),
+        fence_csf_slope_smooth=bool(getattr(args, "fence_csf_slope_smooth", True)),
     )
     selected_points_refined = write_scene_las(
         output_path=scene_refined_las_path,
@@ -359,16 +420,27 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         f"fence_instances={int(refine_stats['fence_instances_before'])}->{int(refine_stats['fence_instances_after'])} "
         f"fence_clusters_filtered_small={int(refine_stats['fence_clusters_filtered_small'])} "
         f"fence_clusters_filtered_low_height={int(refine_stats['fence_clusters_filtered_low_height'])} "
+        f"fence_csf_applied={int(refine_stats.get('fence_csf_instances_applied', 0))} "
+        f"fence_csf_removed={int(refine_stats.get('fence_csf_removed_points_total', 0))} "
         f"final_instances={len(refined_instances)} final_points={selected_points_refined}"
     )
 
+    tree_ground_refs = _tree_station_ground_refs_from_effective_stations(scene_dir / "projected_images")
+    tree_station_xy = None
+    tree_station_ground_z = None
+    if tree_ground_refs is not None:
+        tree_station_xy, tree_station_ground_z = tree_ground_refs
     tree_ground_z = _tree_ground_z_from_effective_stations(scene_dir / "projected_images")
     final_instances, final_point_instance_id, tree_stats, trunk_stage_clusters = _refine_tree_instances(
         points_xyz,
         refined_instances,
         tree_ground_z=tree_ground_z,
+        tree_station_xy=tree_station_xy,
+        tree_station_ground_z=tree_station_ground_z,
         trunk_band_min=float(getattr(args, "tree_trunk_band_min", 0.80)),
         trunk_band_max=float(getattr(args, "tree_trunk_band_max", 1.40)),
+        trunk_height_band_min=float(getattr(args, "tree_trunk_height_band_min", getattr(args, "tree_trunk_band_min", 0.80))),
+        trunk_height_band_max=float(getattr(args, "tree_trunk_height_band_max", getattr(args, "tree_trunk_band_max", 1.40))),
         trunk_dbscan_eps=float(getattr(args, "tree_trunk_dbscan_eps", 0.20)),
         trunk_dbscan_min_samples=int(getattr(args, "tree_trunk_dbscan_min_samples", 3)),
         trunk_min_points=int(getattr(args, "tree_trunk_min_points", 10)),
