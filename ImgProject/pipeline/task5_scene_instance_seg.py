@@ -136,46 +136,46 @@ def parse_args() -> argparse.Namespace:
         help="DBSCAN min_samples used when re-clustering fence points.",
     )
     parser.add_argument(
-        "--fence-csf-enable",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run per-fence-instance CSF ground filtering before fence re-clustering.",
-    )
-    parser.add_argument(
         "--fence-csf-cloth-resolution",
         type=float,
         default=1.0,
-        help="CSF cloth resolution for fence pre-filtering.",
+        help="CSF cloth resolution for scene-level ground extraction used by fence filtering.",
     )
     parser.add_argument(
         "--fence-csf-rigidness",
         type=int,
         default=1,
-        help="CSF rigidness for fence pre-filtering (1-3).",
+        help="CSF rigidness for scene-level ground extraction (1-3).",
     )
     parser.add_argument(
         "--fence-csf-time-step",
         type=float,
         default=0.65,
-        help="CSF time step for fence pre-filtering.",
+        help="CSF time step for scene-level ground extraction.",
     )
     parser.add_argument(
         "--fence-csf-class-threshold",
         type=float,
         default=1.2,
-        help="CSF class threshold for fence pre-filtering.",
+        help="CSF class threshold for scene-level ground extraction.",
     )
     parser.add_argument(
         "--fence-csf-iterations",
         type=int,
         default=800,
-        help="CSF iteration count for fence pre-filtering.",
+        help="CSF iteration count for scene-level ground extraction.",
     )
     parser.add_argument(
         "--fence-csf-slope-smooth",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable CSF slope smoothing for fence pre-filtering.",
+        help="Enable CSF slope smoothing for scene-level ground extraction.",
+    )
+    parser.add_argument(
+        "--fence-csf-low-band-ratio",
+        type=float,
+        default=0.10,
+        help="Only remove fence points within this low-height ratio band when also marked as global CSF ground.",
     )
     parser.add_argument(
         "--tree-trunk-band-min",
@@ -250,10 +250,22 @@ def parse_args() -> argparse.Namespace:
         help="Attach a trunkless tree crown to the nearest trunk when within this XY distance.",
     )
     parser.add_argument(
+        "--tree-final-denoise-eps",
+        type=float,
+        default=0.50,
+        help="Final per-tree DBSCAN eps (meters) after trunk/crown processing; keep largest cluster only.",
+    )
+    parser.add_argument(
         "--save-tree-trunk-anchors",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Save tree trunk anchor LAS files for height/radius stages (one trunk cluster per instance color).",
+    )
+    parser.add_argument(
+        "--save-tree-pre-denoise-las",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save a tree-only LAS before denoise for debugging tree over-merge/over-prune.",
     )
     parser.add_argument("--output-dir-name", type=str, default="fusion", help="Per-scene output folder name.")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for instance colors in LAS.")
@@ -278,6 +290,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     scene_npz_path = output_dir / f"{scene_name}_instance_seg.npz"
     scene_las_path = output_dir / f"{scene_name}_instance_seg.las"
     scene_refined_las_path = output_dir / f"{scene_name}_instance_seg_refined.las"
+    scene_fence_csf_ground_las_path = output_dir / f"{scene_name}_fence_csf_ground.las"
+    scene_tree_pre_denoise_las_path = output_dir / f"{scene_name}_instance_seg_tree_pre_denoise.las"
     scene_final_npz_path = output_dir / f"{scene_name}_instance_seg_final.npz"
     scene_final_las_path = output_dir / f"{scene_name}_instance_seg_final.las"
     scene_tree_trunks_height_las_path = output_dir / f"{scene_name}_instance_seg_tree_trunks_height.las"
@@ -285,12 +299,15 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     scene_tree_trunks_las_path = scene_tree_trunks_radius_las_path
     scene_meta_path = output_dir / f"{scene_name}_instance_seg_meta.json"
     save_tree_trunk_anchors = bool(getattr(args, "save_tree_trunk_anchors", True))
+    save_tree_pre_denoise_las = bool(getattr(args, "save_tree_pre_denoise_las", True))
 
     if (
         (not args.overwrite)
         and scene_npz_path.exists()
         and scene_las_path.exists()
         and scene_refined_las_path.exists()
+        and scene_fence_csf_ground_las_path.exists()
+        and (not save_tree_pre_denoise_las or scene_tree_pre_denoise_las_path.exists())
         and scene_final_npz_path.exists()
         and scene_final_las_path.exists()
         and (not save_tree_trunk_anchors or (
@@ -304,6 +321,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
             "scene_npz": str(scene_npz_path),
             "scene_las": str(scene_las_path),
             "scene_refined_las": str(scene_refined_las_path),
+            "scene_fence_csf_ground_las": str(scene_fence_csf_ground_las_path),
+            "scene_tree_pre_denoise_las": str(scene_tree_pre_denoise_las_path) if save_tree_pre_denoise_las else None,
             "scene_final_npz": str(scene_final_npz_path),
             "scene_final_las": str(scene_final_las_path),
             "scene_tree_trunks_las": str(scene_tree_trunks_las_path) if save_tree_trunk_anchors else None,
@@ -354,6 +373,30 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
 
     assigned_points_before_denoise = int(np.count_nonzero(point_instance_id >= 0))
     print(f"[{scene_name}] point assignment: assigned_points={assigned_points_before_denoise}")
+    tree_instance_ids = np.asarray(
+        [inst_id for inst_id, inst in enumerate(instances) if inst.class_id == TREE_CLASS_ID],
+        dtype=np.int32,
+    )
+    print(f"[{scene_name}] denoise config: skip_tree_instances={int(tree_instance_ids.size)}")
+
+    selected_points_tree_pre_denoise = 0
+    if save_tree_pre_denoise_las:
+        tree_pre_denoise_point_instance_id = np.full(point_instance_id.shape, -1, dtype=np.int32)
+        if tree_instance_ids.size > 0:
+            tree_point_mask = np.isin(point_instance_id, tree_instance_ids, assume_unique=False)
+            tree_pre_denoise_point_instance_id[tree_point_mask] = point_instance_id[tree_point_mask]
+        selected_points_tree_pre_denoise = write_scene_las(
+            output_path=scene_tree_pre_denoise_las_path,
+            las_in=las_data,
+            points_xyz=points_xyz,
+            point_instance_id=tree_pre_denoise_point_instance_id,
+            instances=instances,
+            random_seed=int(args.random_seed),
+        )
+        print(
+            f"[{scene_name}] tree pre-denoise export: "
+            f"points={selected_points_tree_pre_denoise} trees={int(tree_instance_ids.size)}"
+        )
 
     denoise_log = denoise_assignments(
         points_xyz=points_xyz,
@@ -363,6 +406,7 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         eps=float(args.denoise_eps),
         min_points=int(args.denoise_min_points),
         dbscan_min_samples=int(getattr(args, "denoise_dbscan_min_samples", 5)),
+        skip_instance_ids=tree_instance_ids,
     )
 
     instances = rebuild_instances(instances, point_instance_id)
@@ -387,7 +431,7 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         point_confidence=point_confidence,
     )
 
-    refined_instances, refined_point_instance_id, refine_stats = _refine_instances_with_ground_and_fence(
+    refine_result = _refine_instances_with_ground_and_fence(
         points_xyz,
         instances,
         point_instance_id,
@@ -399,14 +443,20 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         fence_min_cluster_points=int(args.fence_min_cluster_points),
         fence_min_height=float(args.fence_min_height),
         fence_dbscan_min_samples=int(getattr(args, "fence_dbscan_min_samples", 5)),
-        fence_csf_enable=bool(getattr(args, "fence_csf_enable", True)),
         fence_csf_cloth_resolution=float(getattr(args, "fence_csf_cloth_resolution", 1.0)),
         fence_csf_rigidness=int(getattr(args, "fence_csf_rigidness", 1)),
         fence_csf_time_step=float(getattr(args, "fence_csf_time_step", 0.65)),
         fence_csf_class_threshold=float(getattr(args, "fence_csf_class_threshold", 1.2)),
         fence_csf_iterations=int(getattr(args, "fence_csf_iterations", 800)),
         fence_csf_slope_smooth=bool(getattr(args, "fence_csf_slope_smooth", True)),
+        fence_csf_low_band_ratio=float(getattr(args, "fence_csf_low_band_ratio", 0.10)),
+        return_fence_global_ground_mask=True,
     )
+    if isinstance(refine_result, tuple) and len(refine_result) == 4:
+        refined_instances, refined_point_instance_id, refine_stats, fence_global_ground_mask = refine_result
+    else:
+        refined_instances, refined_point_instance_id, refine_stats = refine_result  # type: ignore[misc]
+        fence_global_ground_mask = None
     selected_points_refined = write_scene_las(
         output_path=scene_refined_las_path,
         las_in=las_data,
@@ -415,13 +465,28 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         instances=refined_instances,
         random_seed=int(args.random_seed),
     )
+    fence_ground_point_indices = (
+        np.where(fence_global_ground_mask)[0].astype(np.int32, copy=False)
+        if isinstance(fence_global_ground_mask, np.ndarray) and fence_global_ground_mask.shape[0] == points_xyz.shape[0]
+        else np.zeros((0,), dtype=np.int32)
+    )
+    selected_points_fence_csf_ground = write_point_subset_las(
+        output_path=scene_fence_csf_ground_las_path,
+        las_in=las_data,
+        points_xyz=points_xyz,
+        point_indices=fence_ground_point_indices,
+        classification=2,
+        rgb8=(90, 200, 90),
+    )
     print(
         f"[{scene_name}] refined postprocess: ground_removed_points={int(refine_stats['ground_removed_points_total'])} "
         f"fence_instances={int(refine_stats['fence_instances_before'])}->{int(refine_stats['fence_instances_after'])} "
         f"fence_clusters_filtered_small={int(refine_stats['fence_clusters_filtered_small'])} "
         f"fence_clusters_filtered_low_height={int(refine_stats['fence_clusters_filtered_low_height'])} "
-        f"fence_csf_applied={int(refine_stats.get('fence_csf_instances_applied', 0))} "
+        f"fence_global_csf_applied={int(refine_stats.get('fence_global_csf_applied', refine_stats.get('fence_csf_instances_applied', 0)))} "
         f"fence_csf_removed={int(refine_stats.get('fence_csf_removed_points_total', 0))} "
+        f"fence_effective_ground={int(refine_stats.get('fence_effective_ground_points_total', 0))} "
+        f"fence_global_ground_points={selected_points_fence_csf_ground} "
         f"final_instances={len(refined_instances)} final_points={selected_points_refined}"
     )
 
@@ -449,6 +514,7 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         trunk_max_residual=float(getattr(args, "tree_trunk_max_residual", 0.08)),
         trunk_min_verticality=float(getattr(args, "tree_trunk_min_verticality", 0.55)),
         crown_attach_distance=float(getattr(args, "tree_crown_attach_distance", 4.0)),
+        tree_final_denoise_eps=float(getattr(args, "tree_final_denoise_eps", 0.50)),
         return_trunk_stage_clusters=True,
     )
 
@@ -493,6 +559,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         f"trunk_anchors={int(tree_stats['trunk_anchors'])} "
         f"pending_crowns={int(tree_stats['pending_crowns_before_attach'])} "
         f"attached={int(tree_stats['pending_crowns_attached'])} kept={int(tree_stats['pending_crowns_kept'])} dropped={int(tree_stats.get('pending_crowns_dropped', 0))} "
+        f"tree_final_denoise_removed={int(tree_stats.get('tree_final_denoise_removed_points', 0))} "
+        f"tree_final_denoise_touched={int(tree_stats.get('tree_final_denoise_touched_instances', 0))} "
         f"final_instances={len(final_instances)} final_points={selected_points_final} "
         f"trunk_points(height/radius)={selected_points_tree_trunks_height}/{selected_points_tree_trunks_radius}"
     )
@@ -506,6 +574,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         "final_instance_count": len(instances),
         "selected_instance_points": selected_points,
         "selected_instance_points_refined": selected_points_refined,
+        "selected_fence_csf_ground_points": selected_points_fence_csf_ground,
+        "selected_tree_pre_denoise_points": selected_points_tree_pre_denoise,
         "selected_instance_points_final": selected_points_final,
         "selected_tree_trunk_points": selected_points_tree_trunks_radius,
         "selected_tree_trunk_points_height": selected_points_tree_trunks_height,
@@ -518,6 +588,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         "scene_npz": str(scene_npz_path),
         "scene_las": str(scene_las_path),
         "scene_refined_las": str(scene_refined_las_path),
+        "scene_fence_csf_ground_las": str(scene_fence_csf_ground_las_path),
+        "scene_tree_pre_denoise_las": str(scene_tree_pre_denoise_las_path) if save_tree_pre_denoise_las else None,
         "scene_final_npz": str(scene_final_npz_path),
         "scene_final_las": str(scene_final_las_path),
         "scene_tree_trunks_las": str(scene_tree_trunks_las_path) if save_tree_trunk_anchors else None,

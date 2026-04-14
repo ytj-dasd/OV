@@ -18,7 +18,7 @@ from sam3.model.sam3_image_processor import Sam3Processor
 
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 MOSTLY_BLACK_TILE_SKIP_RATIO = 0.8
-DEFAULT_CHECKPOINT = "/home/guitu/文档/vector/sam3/model/sam3.pt"
+DEFAULT_CHECKPOINT = "/home/guitu/文档/OV/sam3/model/sam3.pt"
 
 def _tile_starts(full: int, tile: int, stride: int) -> list[int]:
     if tile <= 0:

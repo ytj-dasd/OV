@@ -173,23 +173,25 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 2. 候选实例先做类别门控：同原类别允许合并；仅 `1 电线杆` 与 `2 路灯杆` 允许跨类合并；`3-6`（路牌/交通标志/红绿灯/监控）仅同类合并；`7 行道树` 仅与 `7 行道树` 合并；`8-15` 其余类别仅同类合并。在类别门控通过后，使用双通道合并：主通道为 `point IoU >= threshold`；补充通道用于“同类实例”以及 `1<->2` 组合（`XY` 中心距离足够小）；树木暂不启用该补充通道，先保持当前 `IoU` 合并强度。候选合并后，若 merged instance 点数小于 `min-merged-points`，则直接丢弃，不进入后续处理。
 3. 对保留下来的 merged instance，先按 `w_angle * confidence` 累加类别得分，确定最终类别；点归属前执行冲突删点：若某点同时属于 `1/2` 与 `3/4/5/6`，优先保留 `3/4/5/6` 并从 `1/2` 删除；若某点同时属于树和围栏，则保留树点并从围栏侧剔除；若某点同时属于树实例和其他非树实例，则保留在非树实例中，并从树实例候选点中剔除。
 4. 点级冲突归属：同一点属于多个实例时，按加权总分取最大实例。
-5. 空间去噪：每实例做空间聚类，仅保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。
+5. 空间去噪（仅非树）：仅对 `class_id != 7` 的实例做空间聚类去噪，保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。树木实例在该步跳过去噪，统一由第 8/9 步树干-树冠后处理完成拆分与清理。
 6. 地面点剔除（非围栏）：对除围栏外的类别执行。按实例点云 `z` 值计算 `z_low = q05(z)` 与 `z_high = q95(z)`，并使用相对高度带 `[z_low + 0.2*(z_high-z_low), z_low + 0.8*(z_high-z_low)]` 的支撑点计算水平 `bbox`，向外扩 `2cm`。最终采用保守剔除：仅删除“低高度带（`z <= z_low + 0.2*(z_high-z_low)`）且位于 `bbox` 外”的点。
-7. 围栏重聚类：围栏实例不做上述 bbox 地面点剔除；在重聚类前，对每个 `class_id=15` 围栏实例单独执行一次 CSF 去地面（实例级，默认开启），再把所有围栏非地面点合并后按 `XY` 连通重新聚类；仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
+7. 围栏重聚类：围栏实例不做上述 bbox 地面点剔除；先对整场景点云执行一次全局 CSF 提取地面掩码，然后仅在围栏分支删除“CSF 判地面且位于围栏实例低高度带（`z <= q05 + r*(q95-q05)`，`r` 为 `--fence-csf-low-band-ratio`）”的点，再把所有围栏非地面点合并后按 `XY` 连通重新聚类；仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
 8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 提取各 station 的位置与高度；对每棵树按 `XY` 质心匹配最近 station，并用该站点 `station_z - 2.0m` 作为该树的地面参考（station 信息异常时回退到全局默认值）。随后将所有树实例中离地 `0.8-1.4m` 的高度带点汇总，在 `XY` 平面执行 DBSCAN 生成树干候选簇。半径仍按该 `0.8-1.4m` 候选簇做 TaubinSVD 圆拟合（半径+残差门控）；高度改为从独立高度带（例如 `0.8-1.8m`）中补点，但补点范围仅限于“参与该候选树干簇合并的树实例”内部，且补点 `XY` 邻域半径固定为 `0.05m`；高度判定直接使用 `z_max - z_min`，并要求其大于 `tree-trunk-min-height`。当前版本已关闭主方向竖直性门控。
-9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。
+9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。树木挂接完成后，对每棵树实例再做一次 3D DBSCAN（`--tree-final-denoise-eps`，默认 `0.5m`），仅保留最大连通簇，以去除误投影到远处墙体等离散噪点。
 
 
 输出（每场景）：
 1. `fusion/{scene_name}_instance_seg.las`：当前 Task5 主流程输出，只包含实例点，按场景内实例 ID 随机着色。
 2. `fusion/{scene_name}_instance_seg_refined.las`：在主流程结果基础上，再经过地面点剔除和围栏重聚类后的 refined LAS。
-3. `fusion/{scene_name}_instance_seg_final.las`：在 refined 结果基础上，再经过树木树干/树冠后处理后的最终 LAS。
-4. `fusion/{scene_name}_instance_seg.npz`：主流程实例 ID、类别、置信度、实例点索引，以及点级唯一归属结果。
-5. `fusion/{scene_name}_instance_seg_final.npz`：最终树木后处理结果对应的实例点索引、类别和点级唯一归属结果。
-6. `fusion/{scene_name}_instance_seg_tree_trunks_height.las`：树干候选经过“稳健高度范围”过滤后的阶段 LAS。
-7. `fusion/{scene_name}_instance_seg_tree_trunks_radius.las`：在高度阶段基础上，再经过“水平稳健半径”过滤后的阶段 LAS。
+3. `fusion/{scene_name}_fence_csf_ground.las`：围栏分支实际用于去地面的点（全局 CSF 掩码与围栏低高度带联合后的有效地面点，`classification=2`），用于调试。
+4. `fusion/{scene_name}_instance_seg_tree_pre_denoise.las`：在“点冲突归属后、空间去噪前”导出的树木专用调试 LAS，仅包含 `class_id=7` 点，按实例 ID 着色，用于排查“多棵树被并到同一实例后仅保留最大簇”的问题。
+5. `fusion/{scene_name}_instance_seg_final.las`：在 refined 结果基础上，再经过树木树干/树冠后处理后的最终 LAS。
+6. `fusion/{scene_name}_instance_seg.npz`：主流程实例 ID、类别、置信度、实例点索引，以及点级唯一归属结果。
+7. `fusion/{scene_name}_instance_seg_final.npz`：最终树木后处理结果对应的实例点索引、类别和点级唯一归属结果。
+8. `fusion/{scene_name}_instance_seg_tree_trunks_height.las`：树干候选经过“稳健高度范围”过滤后的阶段 LAS。
+9. `fusion/{scene_name}_instance_seg_tree_trunks_radius.las`：在高度阶段基础上，再经过“水平稳健半径”过滤后的阶段 LAS。
    以上 2 个 trunk LAS 都会写入额外字段：`trunk_height`、`trunk_radius`、`trunk_dir_x`、`trunk_dir_y`、`trunk_dir_z`、`trunk_dot_z`（以及 `cls_id`）。
-8. `fusion/{scene_name}_instance_seg_meta.json`：去噪/过滤统计日志。
+10. `fusion/{scene_name}_instance_seg_meta.json`：去噪/过滤统计日志。
 
 默认场景级跳过：
 - 若 `fusion/` 已存在且非空，且未启用 `--overwrite`，则直接跳过该场景。
@@ -202,7 +204,7 @@ python ImgProject/pipeline/task5_scene_instance_seg.py \
   --fov-deg 90 \
   --min-mask-points 100 \
   --min-merged-points 500 \
-  --denoise-eps 0.25 \
+  --denoise-eps 0.35 \
   --denoise-min-points 500 \
   --denoise-dbscan-min-samples 5 \
   --ground-z-quantile 0.05 \
@@ -213,6 +215,9 @@ python ImgProject/pipeline/task5_scene_instance_seg.py \
   --fence-min-cluster-points 500 \
   --fence-min-height 0.50 \
   --fence-dbscan-min-samples 5 \
+  --fence-csf-rigidness 3 \
+  --fence-csf-class-threshold 0.35 \
+  --fence-csf-low-band-ratio 0.15 \
   --tree-trunk-band-min 0.80 \
   --tree-trunk-band-max 1.40 \
   --tree-trunk-height-band-min 0.80 \
@@ -224,11 +229,86 @@ python ImgProject/pipeline/task5_scene_instance_seg.py \
   --tree-trunk-max-radius 0.30 \
   --tree-trunk-max-residual 0.04 \
   --tree-crown-attach-distance 4.0 \
+  --tree-final-denoise-eps 0.50 \
+  --no-save-tree-pre-denoise-las \
   --save-tree-trunk-anchors
+
+# 如需关闭树木去噪前调试导出：
+# ... --no-save-tree-pre-denoise-las
+```
+
+### 任务5.1：汇总各场景 Final LAS
+输入：
+1. `benchmark/{scene_name}/fusion/{scene_name}_instance_seg_final.las`（或 `fusion/*_instance_seg_final.las`）。
+
+输出：
+1. `benchmark/instance_seg_final_merged.las`（所有场景 final 实例点云拼接结果）。
+
+要求：
+1. 按场景目录顺序读取并拼接。
+2. 默认保留点坐标、RGB、`classification`，并尽量保留 `cls_id`（若某输入缺失则回填 `classification`）。
+3. 若输出已存在且未开启 `--overwrite`，则直接报错，避免误覆盖。
+
+```bash
+python ImgProject/pipeline/task5_merge_instance_seg_final_las.py \
+  --data-root benchmark \
+  --output-name instance_seg_final_merged.las
+
+# 覆盖已有结果
+# python ImgProject/pipeline/task5_merge_instance_seg_final_las.py \
+#   --data-root benchmark \
+#   --output-name instance_seg_final_merged.las \
+#   --overwrite
+```
+
+### 任务5.2：将 BEV prompt_results 转为独立 LAS
+输入：
+1. `sam3/benchmark/v1/prompt_results/las_positions.txt`（每个场景 BEV 图像左上角坐标）。
+2. `sam3/benchmark/v1/prompt_results/{concept}/*.npz`（`masks/boxes/scores`），例如 `arrow`、`lane_line`、`manhole`。
+3. BEV 分辨率（默认 `0.02m/pixel`）。
+
+处理：
+1. 逐实例读取 `masks`，将像素 `(row, col)` 按下式映射到世界坐标：
+   - `x = left_top_x + col * resolution`
+   - `y = left_top_y - row * resolution`
+   - `z = 3.5`（统一固定高度）
+2. 颜色规则：
+   - `arrow` 与 `lane_line` 使用同一种固定颜色。
+   - `manhole` 按实例随机颜色。
+3. 输出单个独立 LAS，不与任务5.1的 merged LAS 做拼接。
+
+输出：
+1. `sam3/benchmark/v1/prompt_results/arrow_lane_line_manhole_z3p5.las`（示例）。
+
+要求：
+1. 支持按 concept 子目录批量读取。
+2. 对于在 `las_positions.txt` 中找不到坐标的 `image_stem`，跳过并记录告警。
+3. 若输出已存在且未开启 `--overwrite`，直接报错避免误覆盖。
+
+```bash
+python ImgProject/pipeline/task5_prompt_results_to_las.py \
+  --prompt-results-dir sam3/benchmark/v1/prompt_results \
+  --las-positions sam3/benchmark/v1/prompt_results/las_positions.txt \
+  --concepts arrow lane_line manhole \
+  --resolution 0.02 \
+  --z 3.5 \
+  --seed 2026 \
+  --output sam3/benchmark/v1/prompt_results/arrow_lane_line_manhole_z3p5.las
+
+# 覆盖已有结果
+# python ImgProject/pipeline/task5_prompt_results_to_las.py \
+#   --prompt-results-dir sam3/benchmark/v1/prompt_results \
+#   --las-positions sam3/benchmark/v1/prompt_results/las_positions.txt \
+#   --concepts arrow lane_line manhole \
+#   --resolution 0.02 \
+#   --z 3.5 \
+#   --seed 2026 \
+#   --output sam3/benchmark/v1/prompt_results/arrow_lane_line_manhole_z3p5.las \
+#   --overwrite
 ```
 
 
-### 任务6：跨场景边界实例合并
+<!-- ### 任务6：跨场景边界实例合并
 处理：
 1. 仅在相邻场景 bbox overlap + margin 区域生成候选对。
 2. 候选实例按空间聚类与点云 IoU 判定是否合并。
@@ -244,7 +324,7 @@ python ImgProject/pipeline/task5_scene_instance_seg.py \
 ```bash
 python ImgProject/pipeline/task8_cross_scene_merge.py \
   --data-root benchmark \
-  --boundary-margin 2.0
+  --boundary-margin 2.0 -->
 ```
 
 ## 假设与默认值

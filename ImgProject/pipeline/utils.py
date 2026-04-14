@@ -711,7 +711,7 @@ def _ground_bbox_keep_mask(
     return inside_bbox | (~low_ground)
 
 
-def _fence_instance_csf_ground_mask(
+def _csf_ground_mask(
     points_xyz: np.ndarray,
     *,
     cloth_resolution: float = 1.0,
@@ -722,7 +722,7 @@ def _fence_instance_csf_ground_mask(
     slope_smooth: bool = True,
 ) -> np.ndarray | None:
     """
-    Return per-point ground mask for one fence instance with CSF.
+    Return per-point ground mask with CSF.
     Returns None when CSF is unavailable or fails.
     """
     if CSF is None:
@@ -1005,14 +1005,15 @@ def _refine_instances_with_ground_and_fence(
     fence_min_cluster_points: int,
     fence_min_height: float,
     fence_dbscan_min_samples: int = 1,
-    fence_csf_enable: bool = True,
     fence_csf_cloth_resolution: float = 1.0,
     fence_csf_rigidness: int = 1,
     fence_csf_time_step: float = 0.65,
     fence_csf_class_threshold: float = 1.2,
     fence_csf_iterations: int = 800,
     fence_csf_slope_smooth: bool = True,
-) -> tuple[list[SceneInstance], np.ndarray, dict[str, int]]:
+    fence_csf_low_band_ratio: float = 0.10,
+    return_fence_global_ground_mask: bool = False,
+) -> tuple[list[SceneInstance], np.ndarray, dict[str, int]] | tuple[list[SceneInstance], np.ndarray, dict[str, int], np.ndarray | None]:
     refined_instances: list[SceneInstance] = []
     refined_point_instance_id = np.full(point_instance_id.shape, -1, dtype=np.int32)
 
@@ -1064,33 +1065,49 @@ def _refine_instances_with_ground_and_fence(
     fence_csf_instances_unavailable = 0
     fence_csf_all_ground_instances = 0
     fence_csf_removed_points_total = 0
+    fence_effective_ground_mask = np.zeros((points_xyz.shape[0],), dtype=bool)
+    fence_global_ground_mask = _csf_ground_mask(
+        points_xyz,
+        cloth_resolution=float(fence_csf_cloth_resolution),
+        rigidness=int(fence_csf_rigidness),
+        time_step=float(fence_csf_time_step),
+        class_threshold=float(fence_csf_class_threshold),
+        iterations=int(fence_csf_iterations),
+        slope_smooth=bool(fence_csf_slope_smooth),
+    )
+    if fence_global_ground_mask is None or fence_global_ground_mask.shape[0] != points_xyz.shape[0]:
+        fence_global_ground_mask = None
+        fence_csf_instances_unavailable = 1
+    else:
+        fence_csf_instances_applied = 1
+
     if fence_point_chunks:
         fence_point_chunks_after_csf: list[np.ndarray] = []
         for chunk in fence_point_chunks:
             refined_chunk = chunk.astype(np.int32, copy=False)
-            if bool(fence_csf_enable) and refined_chunk.size > 0:
-                local_points = points_xyz[refined_chunk]
-                ground_mask = _fence_instance_csf_ground_mask(
-                    local_points,
-                    cloth_resolution=float(fence_csf_cloth_resolution),
-                    rigidness=int(fence_csf_rigidness),
-                    time_step=float(fence_csf_time_step),
-                    class_threshold=float(fence_csf_class_threshold),
-                    iterations=int(fence_csf_iterations),
-                    slope_smooth=bool(fence_csf_slope_smooth),
-                )
-                if ground_mask is None:
-                    fence_csf_instances_unavailable += 1
-                elif ground_mask.shape[0] == refined_chunk.shape[0]:
-                    fence_csf_instances_applied += 1
-                    keep_mask = ~ground_mask
-                    kept = int(np.count_nonzero(keep_mask))
-                    if kept > 0:
-                        fence_csf_removed_points_total += int(refined_chunk.size - kept)
-                        refined_chunk = refined_chunk[keep_mask].astype(np.int32, copy=False)
-                    else:
-                        # Guardrail: keep original chunk when CSF marks all points as ground.
-                        fence_csf_all_ground_instances += 1
+            if fence_global_ground_mask is not None and refined_chunk.size > 0:
+                local_z = points_xyz[refined_chunk, 2]
+                q = min(1.0, max(0.0, float(ground_quantile)))
+                low_ratio = min(1.0, max(0.0, float(fence_csf_low_band_ratio)))
+                z_low = float(np.quantile(local_z, q))
+                z_high = float(np.quantile(local_z, 0.95))
+                span = max(0.0, z_high - z_low)
+                z_cut = z_low + low_ratio * span
+                local_low_mask = local_z <= z_cut
+
+                global_ground_local = fence_global_ground_mask[refined_chunk.astype(np.int64, copy=False)]
+                remove_mask = global_ground_local & local_low_mask
+                if np.any(remove_mask):
+                    fence_effective_ground_mask[refined_chunk[remove_mask].astype(np.int64, copy=False)] = True
+
+                keep_mask = ~remove_mask
+                kept = int(np.count_nonzero(keep_mask))
+                if kept > 0:
+                    fence_csf_removed_points_total += int(refined_chunk.size - kept)
+                    refined_chunk = refined_chunk[keep_mask].astype(np.int32, copy=False)
+                else:
+                    # Guardrail: keep original chunk when CSF marks all points as ground.
+                    fence_csf_all_ground_instances += 1
             if refined_chunk.size > 0:
                 fence_point_chunks_after_csf.append(refined_chunk.astype(np.int32, copy=False))
 
@@ -1149,7 +1166,14 @@ def _refine_instances_with_ground_and_fence(
         "fence_csf_instances_unavailable": int(fence_csf_instances_unavailable),
         "fence_csf_all_ground_instances": int(fence_csf_all_ground_instances),
         "fence_csf_removed_points_total": int(fence_csf_removed_points_total),
+        "fence_global_csf_applied": int(fence_csf_instances_applied),
+        "fence_global_csf_unavailable": int(fence_csf_instances_unavailable),
+        "fence_global_ground_points_total": int(np.count_nonzero(fence_global_ground_mask)) if fence_global_ground_mask is not None else 0,
+        "fence_effective_ground_points_total": int(np.count_nonzero(fence_effective_ground_mask)),
+        "fence_csf_low_band_ratio": float(fence_csf_low_band_ratio),
     }
+    if return_fence_global_ground_mask:
+        return refined_instances, refined_point_instance_id, stats, fence_effective_ground_mask
     return refined_instances, refined_point_instance_id, stats
 
 def assign_points(
@@ -1251,12 +1275,20 @@ def denoise_assignments(
     eps: float,
     min_points: int,
     dbscan_min_samples: int,
+    skip_instance_ids: np.ndarray | list[int] | set[int] | None = None,
 ) -> dict[str, Any]:
     denoise_logs: list[dict[str, int]] = []
     removed_total = 0
+    skip_ids: set[int] = set()
+    if skip_instance_ids is not None:
+        skip_arr = np.asarray(list(skip_instance_ids) if isinstance(skip_instance_ids, set) else skip_instance_ids, dtype=np.int32).reshape(-1)
+        skip_ids = {int(x) for x in skip_arr}
     for inst_id in range(num_instances):
         point_idx = np.where(point_instance_id == inst_id)[0]
         if point_idx.size == 0:
+            continue
+        if inst_id in skip_ids:
+            denoise_logs.append({"instance_id": int(inst_id), "before": int(point_idx.size), "removed": 0})
             continue
         keep_mask = largest_cluster_mask(
             points_xyz[point_idx],
@@ -1364,6 +1396,51 @@ def write_scene_las(
         if extra_bytes_params is not None and callable(add_extra_dim):
             las_out.add_extra_dim(extra_bytes_params(name="cls_id", type=np.uint8))
             las_out.cls_id = class_ids
+
+    las_out.write(output_path)
+    return int(selected.size)
+
+
+def write_point_subset_las(
+    output_path: Path,
+    las_in: laspy.LasData,
+    points_xyz: np.ndarray,
+    point_indices: np.ndarray,
+    *,
+    classification: int = 2,
+    rgb8: tuple[int, int, int] | None = None,
+) -> int:
+    selected = np.unique(np.asarray(point_indices, dtype=np.int32).reshape(-1))
+    if selected.size > 0:
+        valid = (selected >= 0) & (selected < int(points_xyz.shape[0]))
+        selected = selected[valid]
+
+    header = laspy.LasHeader(point_format=3, version="1.2")
+    header.scales = np.array(las_in.header.scales, copy=True)
+    header.offsets = np.array(las_in.header.offsets, copy=True)
+    las_out = laspy.LasData(header)
+
+    if selected.size > 0:
+        xyz = points_xyz[selected]
+        las_out.x = xyz[:, 0]
+        las_out.y = xyz[:, 1]
+        las_out.z = xyz[:, 2]
+
+        if rgb8 is not None:
+            rgb_arr = np.asarray(rgb8, dtype=np.uint8).reshape(3)
+            rgb16 = (rgb_arr.astype(np.uint16) * 256).reshape(1, 3)
+            repeated = np.repeat(rgb16, selected.size, axis=0)
+            las_out.red = repeated[:, 0]
+            las_out.green = repeated[:, 1]
+            las_out.blue = repeated[:, 2]
+
+        cls = np.full((selected.size,), int(classification), dtype=np.uint8)
+        las_out.classification = cls
+        extra_bytes_params = getattr(laspy, "ExtraBytesParams", None)
+        add_extra_dim = getattr(las_out, "add_extra_dim", None)
+        if extra_bytes_params is not None and callable(add_extra_dim):
+            las_out.add_extra_dim(extra_bytes_params(name="cls_id", type=np.uint8))
+            las_out.cls_id = cls
 
     las_out.write(output_path)
     return int(selected.size)
@@ -1527,6 +1604,7 @@ def _refine_tree_instances(
     trunk_max_residual: float = 0.08,
     trunk_height_band_min: float | None = None,
     trunk_height_band_max: float | None = None,
+    tree_final_denoise_eps: float = 0.50,
     return_trunk_stage_clusters: bool = False,
 ) -> tuple[list[SceneInstance], np.ndarray, dict[str, int]] | tuple[list[SceneInstance], np.ndarray, dict[str, int], dict[str, list[dict[str, Any]]]]:
     copied_instances = [_copy_scene_instance(inst) for inst in instances]
@@ -1539,6 +1617,8 @@ def _refine_tree_instances(
         'pending_crowns_attached': 0,
         'pending_crowns_kept': 0,
         'pending_crowns_dropped': 0,
+        'tree_final_denoise_removed_points': 0,
+        'tree_final_denoise_touched_instances': 0,
     }
     empty_stage = {'height': [], 'radius': [], 'verticality': []}
     if not copied_instances:
@@ -1820,18 +1900,55 @@ def _refine_tree_instances(
             )
         )
 
-    final_instances = non_tree_instances + tree_instances_out
+    tree_instances_out_final: list[SceneInstance] = []
+    tree_final_denoise_removed_points = 0
+    tree_final_denoise_touched_instances = 0
+    tree_final_eps = float(tree_final_denoise_eps)
+    for inst in tree_instances_out:
+        point_indices = np.unique(np.asarray(inst.point_indices, dtype=np.int32))
+        if point_indices.size == 0:
+            continue
+        if tree_final_eps > 0:
+            clusters = _cluster_point_indices(
+                points_xyz,
+                point_indices,
+                eps=tree_final_eps,
+                use_xy_only=False,
+                min_samples=1,
+            )
+            keep_points = clusters[0] if clusters else point_indices
+        else:
+            keep_points = point_indices
+        keep_points = np.unique(np.asarray(keep_points, dtype=np.int32))
+        if keep_points.size == 0:
+            continue
+        removed = int(point_indices.size - keep_points.size)
+        if removed > 0:
+            tree_final_denoise_touched_instances += 1
+            tree_final_denoise_removed_points += removed
+        tree_instances_out_final.append(
+            SceneInstance(
+                class_scores=inst.class_scores,
+                class_id=inst.class_id,
+                class_confidence=inst.class_confidence,
+                point_indices=keep_points,
+            )
+        )
+
+    final_instances = non_tree_instances + tree_instances_out_final
     final_point_instance_id = _build_point_instance_id_from_instances(points_xyz.shape[0], final_instances)
 
     stats = {
         'tree_instances_before': int(tree_instances_before),
-        'tree_instances_after': int(len(tree_instances_out)),
+        'tree_instances_after': int(len(tree_instances_out_final)),
         'trunk_candidate_groups': int(trunk_candidate_groups),
         'trunk_anchors': int(len(anchors)),
         'pending_crowns_before_attach': int(pending_before_attach),
         'pending_crowns_attached': int(pending_attached),
         'pending_crowns_kept': 0,
         'pending_crowns_dropped': int(pending_dropped),
+        'tree_final_denoise_removed_points': int(tree_final_denoise_removed_points),
+        'tree_final_denoise_touched_instances': int(tree_final_denoise_touched_instances),
     }
 
     if return_trunk_stage_clusters:
