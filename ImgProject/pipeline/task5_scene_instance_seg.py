@@ -43,6 +43,113 @@ def write_scene_las(
     )
 
 
+def write_pole_groups_las(
+    output_path: Path,
+    las_in: Any,
+    points_xyz: np.ndarray,
+    *,
+    pole_groups: list[dict[str, Any]],
+    random_seed: int,
+) -> int:
+    task5_utils.laspy = laspy
+    return task5_utils.write_pole_groups_las(
+        output_path=output_path,
+        las_in=las_in,
+        points_xyz=points_xyz,
+        pole_groups=pole_groups,
+        random_seed=random_seed,
+    )
+
+
+def _build_scene_instance_id_map(instances: list[SceneInstance], *, class_min: int = 7) -> np.ndarray:
+    old_to_scene = np.full((len(instances),), -1, dtype=np.int32)
+    next_id = 0
+    for old_id, inst in enumerate(instances):
+        if int(inst.class_id) < int(class_min):
+            continue
+        old_to_scene[old_id] = int(next_id)
+        next_id += 1
+    return old_to_scene
+
+
+def _build_tree_metrics_from_stage_clusters(
+    points_xyz: np.ndarray,
+    instances: list[SceneInstance],
+    trunk_stage_clusters: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    radius_clusters = list(trunk_stage_clusters.get("radius", []))
+    if not radius_clusters:
+        return []
+
+    anchors: list[dict[str, Any]] = []
+    for anchor in radius_clusters:
+        point_indices = np.unique(np.asarray(anchor.get("point_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32))
+        if point_indices.size == 0:
+            continue
+        xy_center = np.asarray(anchor.get("xy_center", np.asarray([np.nan, np.nan], dtype=np.float32)), dtype=np.float32).reshape(-1)
+        robust_radius = float(anchor.get("robust_radius", np.nan))
+        anchors.append(
+            {
+                "point_indices": point_indices.astype(np.int32, copy=False),
+                "xy_center": xy_center[:2] if xy_center.size >= 2 else np.asarray([np.nan, np.nan], dtype=np.float32),
+                "robust_radius": robust_radius,
+            }
+        )
+
+    if not anchors:
+        return []
+
+    tree_instance_ids = [inst_id for inst_id, inst in enumerate(instances) if int(inst.class_id) == int(TREE_CLASS_ID)]
+    used_anchor_ids: set[int] = set()
+    metrics: list[dict[str, Any]] = []
+    for inst_id in tree_instance_ids:
+        inst_points = np.unique(np.asarray(instances[inst_id].point_indices, dtype=np.int32))
+        if inst_points.size == 0:
+            continue
+
+        best_anchor_id = -1
+        best_overlap = -1
+        for anchor_id, anchor in enumerate(anchors):
+            if anchor_id in used_anchor_ids:
+                continue
+            overlap = int(np.intersect1d(inst_points, anchor["point_indices"], assume_unique=False).size)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_anchor_id = int(anchor_id)
+
+        if best_anchor_id < 0 or best_overlap <= 0:
+            inst_xy_center = points_xyz[inst_points.astype(np.int64, copy=False), :2].mean(axis=0)
+            best_dist = float("inf")
+            for anchor_id, anchor in enumerate(anchors):
+                if anchor_id in used_anchor_ids:
+                    continue
+                anchor_center = np.asarray(anchor["xy_center"], dtype=np.float32).reshape(2)
+                if not np.all(np.isfinite(anchor_center)):
+                    continue
+                dist = float(np.linalg.norm(inst_xy_center - anchor_center))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_anchor_id = int(anchor_id)
+
+        if best_anchor_id < 0:
+            continue
+        used_anchor_ids.add(best_anchor_id)
+        anchor = anchors[best_anchor_id]
+        radius = float(anchor["robust_radius"])
+        dbh_m = float(2.0 * radius) if np.isfinite(radius) and radius > 0 else float("nan")
+        center = np.asarray(anchor["xy_center"], dtype=np.float32).reshape(2)
+        metrics.append(
+            {
+                "scene_instance_id": int(inst_id),
+                "dbh_m": dbh_m,
+                "trunk_center_xy": center.astype(np.float32, copy=False),
+                "metric_source": "task5_tree_trunk_radius_stage",
+            }
+        )
+
+    return metrics
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Task567 merged: 2D->3D back-projection, IoU merge, point conflict assignment, denoise."
@@ -256,10 +363,28 @@ def parse_args() -> argparse.Namespace:
         help="Final per-tree DBSCAN eps (meters) after trunk/crown processing; keep largest cluster only.",
     )
     parser.add_argument(
+        "--pole-cluster-eps",
+        type=float,
+        default=0.30,
+        help="DBSCAN eps in XY for merged pole-group clustering on final classes 1-6 points.",
+    )
+    parser.add_argument(
+        "--pole-cluster-min-samples",
+        type=int,
+        default=10,
+        help="DBSCAN min_samples for merged pole-group clustering on final classes 1-6 points.",
+    )
+    parser.add_argument(
         "--save-tree-trunk-anchors",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Save tree trunk anchor LAS files for height/radius stages (one trunk cluster per instance color).",
+    )
+    parser.add_argument(
+        "--save-pole-groups-las",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save merged pole-group LAS carrying pole_group_id and has_cls_1..has_cls_6 flags.",
     )
     parser.add_argument(
         "--save-tree-pre-denoise-las",
@@ -294,12 +419,15 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     scene_tree_pre_denoise_las_path = output_dir / f"{scene_name}_instance_seg_tree_pre_denoise.las"
     scene_final_npz_path = output_dir / f"{scene_name}_instance_seg_final.npz"
     scene_final_las_path = output_dir / f"{scene_name}_instance_seg_final.las"
+    scene_pole_groups_merged_las_path = output_dir / f"{scene_name}_pole_groups_merged.las"
+    scene_tree_metrics_npz_path = output_dir / f"{scene_name}_tree_metrics.npz"
     scene_tree_trunks_height_las_path = output_dir / f"{scene_name}_instance_seg_tree_trunks_height.las"
     scene_tree_trunks_radius_las_path = output_dir / f"{scene_name}_instance_seg_tree_trunks_radius.las"
     scene_tree_trunks_las_path = scene_tree_trunks_radius_las_path
     scene_meta_path = output_dir / f"{scene_name}_instance_seg_meta.json"
     save_tree_trunk_anchors = bool(getattr(args, "save_tree_trunk_anchors", True))
     save_tree_pre_denoise_las = bool(getattr(args, "save_tree_pre_denoise_las", True))
+    save_pole_groups_las = bool(getattr(args, "save_pole_groups_las", False))
 
     if (
         (not args.overwrite)
@@ -310,6 +438,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         and (not save_tree_pre_denoise_las or scene_tree_pre_denoise_las_path.exists())
         and scene_final_npz_path.exists()
         and scene_final_las_path.exists()
+        and scene_tree_metrics_npz_path.exists()
+        and (not save_pole_groups_las or scene_pole_groups_merged_las_path.exists())
         and (not save_tree_trunk_anchors or (
             scene_tree_trunks_height_las_path.exists()
             and scene_tree_trunks_radius_las_path.exists()
@@ -325,6 +455,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
             "scene_tree_pre_denoise_las": str(scene_tree_pre_denoise_las_path) if save_tree_pre_denoise_las else None,
             "scene_final_npz": str(scene_final_npz_path),
             "scene_final_las": str(scene_final_las_path),
+            "scene_tree_metrics_npz": str(scene_tree_metrics_npz_path),
+            "scene_pole_groups_merged_las": str(scene_pole_groups_merged_las_path) if save_pole_groups_las else None,
             "scene_tree_trunks_las": str(scene_tree_trunks_las_path) if save_tree_trunk_anchors else None,
             "scene_tree_trunks_height_las": str(scene_tree_trunks_height_las_path) if save_tree_trunk_anchors else None,
             "scene_tree_trunks_radius_las": str(scene_tree_trunks_radius_las_path) if save_tree_trunk_anchors else None,
@@ -526,6 +658,23 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         instances=final_instances,
         random_seed=int(args.random_seed),
     )
+
+    pole_groups, point_pole_group_id = build_pole_groups(
+        points_xyz=points_xyz,
+        instances=final_instances,
+        eps=float(getattr(args, "pole_cluster_eps", 0.30)),
+        min_samples=int(getattr(args, "pole_cluster_min_samples", 10)),
+    )
+    selected_points_pole_groups = 0
+    if save_pole_groups_las:
+        selected_points_pole_groups = write_pole_groups_las(
+            output_path=scene_pole_groups_merged_las_path,
+            las_in=las_data,
+            points_xyz=points_xyz,
+            pole_groups=pole_groups,
+            random_seed=int(args.random_seed),
+        )
+
     final_point_confidence = np.where(final_point_instance_id >= 0, 1.0, 0.0).astype(np.float32, copy=False)
     save_scene_npz(
         output_path=scene_final_npz_path,
@@ -533,6 +682,31 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         instances=final_instances,
         point_instance_id=final_point_instance_id,
         point_confidence=final_point_confidence,
+        pole_groups=pole_groups,
+        point_pole_group_id=point_pole_group_id,
+        scene_instance_class_min=7,
+    )
+    old_to_scene_instance = _build_scene_instance_id_map(final_instances, class_min=7)
+    tree_metrics_old_ids = _build_tree_metrics_from_stage_clusters(
+        points_xyz=points_xyz,
+        instances=final_instances,
+        trunk_stage_clusters=trunk_stage_clusters,
+    )
+    tree_metrics: list[dict[str, Any]] = []
+    for item in tree_metrics_old_ids:
+        old_id = int(item.get("scene_instance_id", -1))
+        if old_id < 0 or old_id >= old_to_scene_instance.shape[0]:
+            continue
+        scene_instance_id = int(old_to_scene_instance[old_id])
+        if scene_instance_id < 0:
+            continue
+        item_copy = dict(item)
+        item_copy["scene_instance_id"] = int(scene_instance_id)
+        tree_metrics.append(item_copy)
+    save_tree_metrics_npz(
+        output_path=scene_tree_metrics_npz_path,
+        scene_name=scene_name,
+        tree_metrics=tree_metrics,
     )
 
     selected_points_tree_trunks_height = 0
@@ -564,6 +738,10 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         f"final_instances={len(final_instances)} final_points={selected_points_final} "
         f"trunk_points(height/radius)={selected_points_tree_trunks_height}/{selected_points_tree_trunks_radius}"
     )
+    print(
+        f"[{scene_name}] pole groups: groups={len(pole_groups)} points={selected_points_pole_groups} "
+        f"tree_metrics={len(tree_metrics)}"
+    )
 
     meta = {
         "scene": scene_name,
@@ -577,6 +755,9 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         "selected_fence_csf_ground_points": selected_points_fence_csf_ground,
         "selected_tree_pre_denoise_points": selected_points_tree_pre_denoise,
         "selected_instance_points_final": selected_points_final,
+        "selected_pole_group_points": selected_points_pole_groups,
+        "pole_group_count": int(len(pole_groups)),
+        "tree_metric_count": int(len(tree_metrics)),
         "selected_tree_trunk_points": selected_points_tree_trunks_radius,
         "selected_tree_trunk_points_height": selected_points_tree_trunks_height,
         "selected_tree_trunk_points_radius": selected_points_tree_trunks_radius,
@@ -592,6 +773,8 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         "scene_tree_pre_denoise_las": str(scene_tree_pre_denoise_las_path) if save_tree_pre_denoise_las else None,
         "scene_final_npz": str(scene_final_npz_path),
         "scene_final_las": str(scene_final_las_path),
+        "scene_tree_metrics_npz": str(scene_tree_metrics_npz_path),
+        "scene_pole_groups_merged_las": str(scene_pole_groups_merged_las_path) if save_pole_groups_las else None,
         "scene_tree_trunks_las": str(scene_tree_trunks_las_path) if save_tree_trunk_anchors else None,
         "scene_tree_trunks_height_las": str(scene_tree_trunks_height_las_path) if save_tree_trunk_anchors else None,
         "scene_tree_trunks_radius_las": str(scene_tree_trunks_radius_las_path) if save_tree_trunk_anchors else None,

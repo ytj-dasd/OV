@@ -1445,38 +1445,379 @@ def write_point_subset_las(
     las_out.write(output_path)
     return int(selected.size)
 
+
+def build_pole_groups(
+    points_xyz: np.ndarray,
+    instances: list[SceneInstance],
+    *,
+    eps: float = 0.3,
+    min_samples: int = 10,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    """
+    Build merged pole groups from point-level clustering of class 1..6 points.
+
+    Returns:
+      pole_groups: list of dicts with merged metadata
+      point_pole_group_id: (N,) int32, -1 for non-pole-group points
+    """
+    num_points = int(points_xyz.shape[0])
+    point_pole_group_id = np.full((num_points,), -1, dtype=np.int32)
+
+    source_entries: list[dict[str, Any]] = []
+    source_chunks: list[np.ndarray] = []
+    pole_class_ids = FULL_POLE_CLASS_IDS | SIGN_LIKE_CLASS_IDS
+
+    for inst_id, inst in enumerate(instances):
+        class_id = int(inst.class_id)
+        if class_id not in pole_class_ids:
+            continue
+        pts = np.unique(np.asarray(inst.point_indices, dtype=np.int32).reshape(-1))
+        if pts.size == 0:
+            continue
+        valid = (pts >= 0) & (pts < num_points)
+        pts = pts[valid].astype(np.int32, copy=False)
+        if pts.size == 0:
+            continue
+        source_entries.append(
+            {
+                "instance_id": int(inst_id),
+                "class_id": int(class_id),
+                "point_indices": pts,
+            }
+        )
+        source_chunks.append(pts)
+
+    if not source_chunks:
+        return [], point_pole_group_id
+
+    pole_points = np.unique(np.concatenate(source_chunks, axis=0)).astype(np.int32, copy=False)
+    clusters = _cluster_point_indices(
+        points_xyz,
+        pole_points,
+        eps=float(eps),
+        use_xy_only=True,
+        min_samples=max(1, int(min_samples)),
+    )
+
+    pole_groups: list[dict[str, Any]] = []
+    for cluster in clusters:
+        cluster_points = np.unique(np.asarray(cluster, dtype=np.int32).reshape(-1))
+        if cluster_points.size == 0:
+            continue
+        valid = (cluster_points >= 0) & (cluster_points < num_points)
+        cluster_points = cluster_points[valid].astype(np.int32, copy=False)
+        if cluster_points.size == 0:
+            continue
+
+        member_instance_ids: list[int] = []
+        candidate_class_ids: set[int] = set()
+        for entry in source_entries:
+            if np.intersect1d(cluster_points, entry["point_indices"], assume_unique=False).size == 0:
+                continue
+            member_instance_ids.append(int(entry["instance_id"]))
+            candidate_class_ids.add(int(entry["class_id"]))
+
+        if not member_instance_ids:
+            continue
+
+        pole_id = len(pole_groups)
+        point_pole_group_id[cluster_points.astype(np.int64, copy=False)] = int(pole_id)
+
+        candidate_ids_sorted = np.asarray(sorted(candidate_class_ids), dtype=np.int32)
+        candidate_names = np.asarray(
+            [CLASS_ID_TO_NAME.get(int(cid), "") for cid in candidate_ids_sorted],
+            dtype="<U16",
+        )
+        group: dict[str, Any] = {
+            "pole_id": int(pole_id),
+            "point_indices": cluster_points.astype(np.int32, copy=False),
+            "member_instance_ids": np.asarray(sorted(set(member_instance_ids)), dtype=np.int32),
+            "candidate_class_ids": candidate_ids_sorted,
+            "candidate_class_names": candidate_names,
+        }
+        for cls_id in range(1, 7):
+            group[f"has_cls_{cls_id}"] = int(cls_id in candidate_class_ids)
+
+        pole_groups.append(group)
+
+    return pole_groups, point_pole_group_id
+
+
+def write_pole_groups_las(
+    output_path: Path,
+    las_in: laspy.LasData,
+    points_xyz: np.ndarray,
+    *,
+    pole_groups: list[dict[str, Any]],
+    random_seed: int,
+) -> int:
+    """
+    Write merged pole-group LAS.
+
+    Output only includes pole-group points; classification/cls_id are fixed to 1.
+    Additional dimensions: pole_group_id, has_cls_1..has_cls_6.
+    """
+    num_points = int(points_xyz.shape[0])
+    point_group_id = np.full((num_points,), -1, dtype=np.int32)
+    point_has_cls = {
+        cls_id: np.zeros((num_points,), dtype=np.uint8)
+        for cls_id in range(1, 7)
+    }
+
+    for group in pole_groups:
+        pole_id = int(group.get("pole_id", -1))
+        if pole_id < 0:
+            continue
+        pts = np.unique(np.asarray(group.get("point_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1))
+        if pts.size == 0:
+            continue
+        valid = (pts >= 0) & (pts < num_points)
+        pts = pts[valid].astype(np.int32, copy=False)
+        if pts.size == 0:
+            continue
+        point_group_id[pts.astype(np.int64, copy=False)] = pole_id
+        for cls_id in range(1, 7):
+            value = int(group.get(f"has_cls_{cls_id}", 0))
+            point_has_cls[cls_id][pts.astype(np.int64, copy=False)] = np.uint8(1 if value != 0 else 0)
+
+    selected = np.where(point_group_id >= 0)[0].astype(np.int32, copy=False)
+    header = laspy.LasHeader(point_format=3, version="1.2")
+    header.scales = np.array(las_in.header.scales, copy=True)
+    header.offsets = np.array(las_in.header.offsets, copy=True)
+    las_out = laspy.LasData(header)
+
+    extra_bytes_params = getattr(laspy, "ExtraBytesParams", None)
+    add_extra_dim = getattr(las_out, "add_extra_dim", None)
+    if extra_bytes_params is not None and callable(add_extra_dim):
+        las_out.add_extra_dim(extra_bytes_params(name="cls_id", type=np.uint8))
+        las_out.add_extra_dim(extra_bytes_params(name="pole_group_id", type=np.int32))
+        for cls_id in range(1, 7):
+            las_out.add_extra_dim(extra_bytes_params(name=f"has_cls_{cls_id}", type=np.uint8))
+
+    if selected.size > 0:
+        xyz = points_xyz[selected]
+        las_out.x = xyz[:, 0]
+        las_out.y = xyz[:, 1]
+        las_out.z = xyz[:, 2]
+
+        group_ids = point_group_id[selected]
+        num_groups = int(group_ids.max()) + 1
+        color_table = _instance_colors(num_groups, seed=random_seed)
+        rgb8 = color_table[group_ids]
+        rgb16 = rgb8.astype(np.uint16) * 256
+        las_out.red = rgb16[:, 0]
+        las_out.green = rgb16[:, 1]
+        las_out.blue = rgb16[:, 2]
+
+        cls = np.full((selected.size,), 1, dtype=np.uint8)
+        las_out.classification = cls
+
+        if extra_bytes_params is not None and callable(add_extra_dim):
+            las_out.cls_id = cls
+            las_out.pole_group_id = group_ids.astype(np.int32, copy=False)
+            for cls_id in range(1, 7):
+                setattr(las_out, f"has_cls_{cls_id}", point_has_cls[cls_id][selected])
+
+    las_out.write(output_path)
+    return int(selected.size)
+
 def save_scene_npz(
     output_path: Path,
     scene_name: str,
     instances: list[SceneInstance],
     point_instance_id: np.ndarray,
     point_confidence: np.ndarray,
+    *,
+    pole_groups: list[dict[str, Any]] | None = None,
+    point_pole_group_id: np.ndarray | None = None,
+    scene_instance_class_min: int = 1,
 ) -> None:
-    instance_count = len(instances)
-    inst_ids = np.arange(instance_count, dtype=np.int32)
-    inst_class_ids = np.asarray([inst.class_id for inst in instances], dtype=np.int32)
-    inst_class_names = np.asarray([CLASS_ID_TO_NAME.get(int(cid), "") for cid in inst_class_ids], dtype="<U16")
-    inst_conf = np.asarray([inst.class_confidence for inst in instances], dtype=np.float32)
-    inst_points = np.empty((instance_count,), dtype=object)
-    for i, inst in enumerate(instances):
-        inst_points[i] = inst.point_indices.astype(np.int32, copy=False)
+    if pole_groups is None:
+        instance_count = len(instances)
+        inst_ids = np.arange(instance_count, dtype=np.int32)
+        inst_class_ids = np.asarray([inst.class_id for inst in instances], dtype=np.int32)
+        inst_class_names = np.asarray([CLASS_ID_TO_NAME.get(int(cid), "") for cid in inst_class_ids], dtype="<U16")
+        inst_conf = np.asarray([inst.class_confidence for inst in instances], dtype=np.float32)
+        inst_points = np.empty((instance_count,), dtype=object)
+        for i, inst in enumerate(instances):
+            inst_points[i] = inst.point_indices.astype(np.int32, copy=False)
 
-    if instance_count > 0:
-        class_scores = np.stack([inst.class_scores[1:] for inst in instances], axis=0).astype(np.float32, copy=False)
+        if instance_count > 0:
+            class_scores = np.stack([inst.class_scores[1:] for inst in instances], axis=0).astype(np.float32, copy=False)
+        else:
+            class_scores = np.zeros((0, NUM_CLASSES), dtype=np.float32)
+
+        np.savez_compressed(
+            output_path,
+            scene_name=np.array(scene_name),
+            scene_instance_id=inst_ids,
+            class_id=inst_class_ids,
+            class_name=inst_class_names,
+            confidence=inst_conf,
+            class_scores=class_scores,
+            point_indices=inst_points,
+            point_instance_id=point_instance_id.astype(np.int32, copy=False),
+            point_confidence=point_confidence.astype(np.float32, copy=False),
+        )
+        return
+
+    # Compact final mode:
+    # - scene_instance keeps only classes >= scene_instance_class_min (typically 7..15)
+    # - 1..6 are represented by pole_groups
+    num_points = int(point_instance_id.shape[0])
+    point_scene_instance_id = np.full((num_points,), -1, dtype=np.int32)
+    keep_old_ids: list[int] = []
+    for old_idx, inst in enumerate(instances):
+        if int(inst.class_id) < int(scene_instance_class_min):
+            continue
+        keep_old_ids.append(int(old_idx))
+
+    old_to_new = np.full((len(instances),), -1, dtype=np.int32)
+    for new_id, old_id in enumerate(keep_old_ids):
+        old_to_new[old_id] = int(new_id)
+
+    scene_instance_count = len(keep_old_ids)
+    scene_instance_ids = np.arange(scene_instance_count, dtype=np.int32)
+    scene_instance_class_id = np.asarray([int(instances[old_id].class_id) for old_id in keep_old_ids], dtype=np.int32)
+    scene_instance_class_name = np.asarray(
+        [CLASS_ID_TO_NAME.get(int(cid), "") for cid in scene_instance_class_id],
+        dtype="<U16",
+    )
+    scene_instance_confidence = np.asarray(
+        [float(instances[old_id].class_confidence) for old_id in keep_old_ids],
+        dtype=np.float32,
+    )
+    scene_instance_point_indices = np.empty((scene_instance_count,), dtype=object)
+    scene_instance_class_scores = np.zeros((scene_instance_count, NUM_CLASSES), dtype=np.float32)
+    for new_id, old_id in enumerate(keep_old_ids):
+        inst = instances[old_id]
+        pts = np.unique(np.asarray(inst.point_indices, dtype=np.int32).reshape(-1))
+        valid = (pts >= 0) & (pts < num_points)
+        scene_instance_point_indices[new_id] = pts[valid].astype(np.int32, copy=False)
+        scene_instance_class_scores[new_id] = inst.class_scores[1:].astype(np.float32, copy=False)
+        point_scene_instance_id[point_instance_id == int(old_id)] = int(new_id)
+
+    pole_groups_list = pole_groups or []
+    pole_group_count = len(pole_groups_list)
+    pole_group_id = np.arange(pole_group_count, dtype=np.int32)
+    pole_group_candidate_class_ids = np.empty((pole_group_count,), dtype=object)
+    pole_group_candidate_class_names = np.empty((pole_group_count,), dtype=object)
+    pole_group_member_instance_ids = np.empty((pole_group_count,), dtype=object)
+    pole_group_point_indices = np.empty((pole_group_count,), dtype=object)
+    pole_group_has_flags = {
+        cls_id: np.zeros((pole_group_count,), dtype=np.uint8)
+        for cls_id in range(1, 7)
+    }
+    for idx, group in enumerate(pole_groups_list):
+        candidate_ids = np.unique(
+            np.asarray(group.get("candidate_class_ids", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        ).astype(np.int32, copy=False)
+        candidate_names = np.asarray(
+            group.get("candidate_class_names", np.asarray([CLASS_ID_TO_NAME.get(int(cid), "") for cid in candidate_ids], dtype="<U16")),
+            dtype=object,
+        ).reshape(-1)
+        member_ids = np.unique(
+            np.asarray(group.get("member_instance_ids", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        ).astype(np.int32, copy=False)
+        points = np.unique(
+            np.asarray(group.get("point_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        )
+        valid = (points >= 0) & (points < num_points)
+        points = points[valid].astype(np.int32, copy=False)
+
+        pole_group_candidate_class_ids[idx] = candidate_ids
+        pole_group_candidate_class_names[idx] = candidate_names
+        pole_group_member_instance_ids[idx] = member_ids
+        pole_group_point_indices[idx] = points
+        for cls_id in range(1, 7):
+            pole_group_has_flags[cls_id][idx] = np.uint8(1 if int(group.get(f"has_cls_{cls_id}", 0)) != 0 else 0)
+
+    if point_pole_group_id is None:
+        point_pole_group_id_arr = np.full((num_points,), -1, dtype=np.int32)
     else:
-        class_scores = np.zeros((0, NUM_CLASSES), dtype=np.float32)
+        point_pole_group_id_arr = np.asarray(point_pole_group_id, dtype=np.int32).reshape(-1)
+        if point_pole_group_id_arr.shape[0] != num_points:
+            fixed = np.full((num_points,), -1, dtype=np.int32)
+            copy_n = min(num_points, point_pole_group_id_arr.shape[0])
+            fixed[:copy_n] = point_pole_group_id_arr[:copy_n]
+            point_pole_group_id_arr = fixed
 
     np.savez_compressed(
         output_path,
         scene_name=np.array(scene_name),
-        scene_instance_id=inst_ids,
-        class_id=inst_class_ids,
-        class_name=inst_class_names,
-        confidence=inst_conf,
-        class_scores=class_scores,
-        point_indices=inst_points,
-        point_instance_id=point_instance_id.astype(np.int32, copy=False),
+        scene_instance_id=scene_instance_ids,
+        scene_instance_class_id=scene_instance_class_id,
+        scene_instance_class_name=scene_instance_class_name,
+        scene_instance_confidence=scene_instance_confidence,
+        scene_instance_class_scores=scene_instance_class_scores,
+        scene_instance_point_indices=scene_instance_point_indices,
+        point_scene_instance_id=point_scene_instance_id.astype(np.int32, copy=False),
         point_confidence=point_confidence.astype(np.float32, copy=False),
+        pole_group_id=pole_group_id,
+        pole_group_candidate_class_ids=pole_group_candidate_class_ids,
+        pole_group_candidate_class_names=pole_group_candidate_class_names,
+        pole_group_member_instance_ids=pole_group_member_instance_ids,
+        pole_group_point_indices=pole_group_point_indices,
+        point_pole_group_id=point_pole_group_id_arr.astype(np.int32, copy=False),
+        pole_group_has_cls_1=pole_group_has_flags[1],
+        pole_group_has_cls_2=pole_group_has_flags[2],
+        pole_group_has_cls_3=pole_group_has_flags[3],
+        pole_group_has_cls_4=pole_group_has_flags[4],
+        pole_group_has_cls_5=pole_group_has_flags[5],
+        pole_group_has_cls_6=pole_group_has_flags[6],
+    )
+
+
+def save_scene_final_npz_compact(
+    output_path: Path,
+    scene_name: str,
+    instances: list[SceneInstance],
+    point_instance_id: np.ndarray,
+    point_confidence: np.ndarray,
+    pole_groups: list[dict[str, Any]],
+    point_pole_group_id: np.ndarray,
+) -> None:
+    save_scene_npz(
+        output_path=output_path,
+        scene_name=scene_name,
+        instances=instances,
+        point_instance_id=point_instance_id,
+        point_confidence=point_confidence,
+        pole_groups=pole_groups,
+        point_pole_group_id=point_pole_group_id,
+        scene_instance_class_min=7,
+    )
+
+
+def save_tree_metrics_npz(
+    output_path: Path,
+    scene_name: str,
+    tree_metrics: list[dict[str, Any]],
+) -> None:
+    n = len(tree_metrics)
+    scene_instance_id = np.full((n,), -1, dtype=np.int32)
+    dbh_m = np.full((n,), np.nan, dtype=np.float32)
+    trunk_center_x = np.full((n,), np.nan, dtype=np.float32)
+    trunk_center_y = np.full((n,), np.nan, dtype=np.float32)
+    metric_source = np.full((n,), "", dtype="<U32")
+
+    for idx, item in enumerate(tree_metrics):
+        scene_instance_id[idx] = int(item.get("scene_instance_id", -1))
+        dbh_m[idx] = np.float32(item.get("dbh_m", np.nan))
+        center = np.asarray(item.get("trunk_center_xy", np.asarray([np.nan, np.nan], dtype=np.float32)), dtype=np.float32).reshape(-1)
+        if center.size >= 2:
+            trunk_center_x[idx] = np.float32(center[0])
+            trunk_center_y[idx] = np.float32(center[1])
+        metric_source[idx] = str(item.get("metric_source", ""))
+
+    np.savez_compressed(
+        output_path,
+        scene_name=np.array(scene_name),
+        scene_instance_id=scene_instance_id,
+        dbh_m=dbh_m,
+        trunk_center_x=trunk_center_x,
+        trunk_center_y=trunk_center_y,
+        metric_source=metric_source,
     )
 
 

@@ -1,12 +1,13 @@
-# Zero-Shot 多场景点云实例分割实施计划（VLM + SAM）
+# Zero-Shot 多模态 OV 要素提取（VLM + SAM + Attribute）
 
 ## 摘要
-按一场景一目录组织多场景点云，流程固定为：
+按一场景一目录组织多场景点云，主流程固定为：
 1. 点云投影为多视角图像，并输出点-像素对应关系。
-2. Qwen3VL 对每张图做目标类别筛选，减少 SAM 调用类别数。
-3. SAM 的 `.npz` 结果（包含全部 `mask/box/score`），不做适配层。
-4. 将 2D 实例回投到 3D 点云，做多视角实例合并、类别加权、点级冲突消解。
-5. 场景内实例去噪后，执行跨场景边界实例合并，输出全局实例结果。
+2. Qwen3VL/GLM-V 对每张图做类别筛选，减少 SAM 调用类别数。
+3. SAM 输出每图 `.npz`（包含 `masks/boxes/scores`）。
+4. Task5 将 2D 实例回投到 3D 点云，做合并、冲突消解、去噪、树木后处理。
+5. Task5 额外输出杆状物聚类结果（6 类杆状物）与仅杆状物聚类 LAS。
+6. Task6 执行属性提取：先 BEV 全局，再 Front 场景级，输出结构化属性结果。
 
 ## 目录结构与命名规范
 
@@ -20,6 +21,7 @@
       station_{sid}_cam_{cam}.png
       station_{sid}_cam_{cam}.npz
       num_points.txt
+      effective_stations.json
     vlm_desc/
       station_{sid}_cam_{cam}.vlm.txt
       scene_vlm_summary.json
@@ -27,14 +29,28 @@
       station_{sid}_cam_{cam}.npz
     fusion/
       {scene_name}_instance_seg.las
+      {scene_name}_instance_seg_refined.las
+      {scene_name}_instance_seg_final.las
       {scene_name}_instance_seg.npz
+      {scene_name}_instance_seg_final.npz
+      {scene_name}_pole_groups.npz
+      {scene_name}_pole_groups_merged.las
+      {scene_name}_tree_metrics.npz
       {scene_name}_instance_seg_meta.json
+    attributes/
+      {scene_name}_task6_front_attributes.npz
+      {scene_name}_task6_front_attributes.json
 
-  cross_scene/
-    boundary_candidates.json
+  bev/
     global_instances.npz
-    global_point_assignment.npz
-    global_instance_meta.json
+    global_rgb.png
+    las_positions.txt
+    bev_attributes_global.npz
+    bev_attributes_global.json
+
+  attributes_global/
+    task6_front_attributes_merged.npz
+    task6_front_attributes_merged.json
 ```
 
 关键命名要求：
@@ -44,9 +60,11 @@
 4. 对应关系 `.npz` 必含键：`dist_img`, `pts_img_indices`, `pts_indices`。
 5. VLM 输出后缀固定为 `.vlm.txt`（每图一个）。
 6. SAM 输出后缀固定为 `.npz`（每图一个）。
+7. Task5 杆状物聚类输出固定为 `*_pole_groups.npz` 和 `*_pole_groups_merged.las`。
+8. Task6 BEV 输出仅写入 `benchmark/bev`；Front 输出仅写入各场景 `attributes/`。
 
 ## class_vocab 规范
-实现时必须提供 `class_vocab.yaml`，并包含且仅包含以下 14 类（标准类别名）：
+实现时必须提供 `class_vocab.yaml`，并包含以下 15 类（标准类别名）：
 1. 电线杆
 2. 路灯杆
 3. 路牌
@@ -65,17 +83,21 @@
 
 `class_vocab.yaml` 至少包含字段：
 - `id`: 连续整数 ID（建议从 1 开始，0 保留为背景）。
-- `name_zh`: 中文标准名（上面 15 类之一）。
+- `name_zh`: 中文标准名。
 - `aliases`: 同义词列表（用于 VLM 文本解析归一化）。
 
 ## 关键接口与中间数据
 1. `vlm_desc/*.vlm.txt`：每行格式 `class_name<TAB>confidence`，仅保留命中类别。
-2. `sam_mask/*.npz`：直接使用你现有格式，至少能读取：
-`masks`, `boxes`, `scores`。
-3. `fusion/{scene_name}_instance_seg.npz` 至少包含：
-`scene_instance_id`, `class_id`, `class_name`, `confidence`, `point_indices`。
-4. 同一 `.npz` 同时包含点级归属：
-`point_instance_id (N,int32)`, `point_confidence (N,float32)`。
+2. `sam_mask/*.npz`：至少包含 `masks`, `boxes`, `scores`。
+3. `fusion/{scene_name}_instance_seg_final.npz` 至少包含：
+`scene_instance_id`, `scene_instance_class_id`, `scene_instance_class_name`, `scene_instance_confidence`, `scene_instance_point_indices`（仅 `class_id in 7..15`）；
+`pole_group_id`, `pole_group_candidate_class_ids`, `pole_group_candidate_class_names`, `pole_group_member_instance_ids`, `pole_group_point_indices`（对应杆状物 1..6 合并结果）；
+`point_scene_instance_id`, `point_pole_group_id`（点级回溯索引，未归属为 `-1`）。
+4. `fusion/{scene_name}_pole_groups.npz`（可选调试）至少包含：
+`pole_id`, `point_indices`, `member_instance_ids`, `candidate_class_ids`, `candidate_class_names`。
+5. `fusion/{scene_name}_tree_metrics.npz` 至少包含：
+`scene_instance_id`, `dbh_m`, `trunk_center_x`, `trunk_center_y`, `metric_source`。
+6. `bev/bev_attributes_global.npz` 与 `{scene}/attributes/*front_attributes.npz` 语义与对应 JSON 一致，仅存储形态不同。
 
 ## 实施任务
 
@@ -92,47 +114,19 @@
 输出：`projected_images/*.png`、`projected_images/*.npz`、`projected_images/num_points.txt`、`projected_images/effective_stations.json`。
 要求：
 1. 每张 `.png` 必有同名 `.npz`。
-2. `effective_stations.json` 必须保存实际用于投影的相机外参；若启用了地形高度修正，这里保存修正后的外参。
+2. `effective_stations.json` 保存实际用于投影的相机外参（包含地形修正后的外参）。
 3. `.npz` 内 `pts_indices` 不得越界。
-4. 图像渲染采用两层逻辑：
-   - 点像素对应关系 `.npz` 仍按“当前像素最近点 + buffer 扩张”生成，保持 2D->3D 回投语义不变。
-   - 图像赋色改为 soft-splat：每个点以连续投影坐标向邻域像素发核，像素按空间距离与深度一致性对候选点做加权归一化。
-5. 像素前景深度优先使用“当前像素自己的硬命中点深度”；如果该像素没有硬命中点，则用邻域候选点中的最小深度作为前景深度，再执行 soft-splat 赋色与补连续性。
-6. 因此前景归属和颜色平滑解耦：前景边缘不被邻域核直接抢占，空像素则由邻域点在深度约束下自然补全。
-7. 旧 render_img_gpu 是硬覆盖，谁最近就直接拿谁的颜色，边缘容易出现斑块和发硬的扩张感。新方案是软融合，过渡更自然。旧方案的补洞发生在像素层，已经丢失了子像素信息。新方案从连续 u/v 开始，天然保留子像素几何信息。
-```bash
-    uv run main.py
-    SOFT_SPLAT_RADIUS_MIN/MAX 控制核大小
-    SOFT_SPLAT_DEPTH_STEP 控制多远开始增大核
-    SOFT_SPLAT_SIGMA_SCALE 控制空间扩散强度
-    SOFT_SPLAT_DEPTH_GATE_BASE/SCALE 控制深度门控松紧
-    SOFT_SPLAT_DEPTH_SIGMA_SCALE 控制通过门控后的深度软融合强度
-```
+4. 图像渲染继续使用任务2既有策略（当前软融合/前景深度约束逻辑），Task6 不引入新渲染分支。
 
 ### 任务3：GLM-V/Qwen3VL 图像描述与类别筛选
-输入：`projected_images/*.png` + 固定 14 类提示词。
+输入：`projected_images/*.png` + 固定 15 类提示词。
 输出：
 1. 每图 `vlm_desc/{img_stem}.vlm.txt`。
 2. 场景级汇总 `vlm_desc/scene_vlm_summary.json`。
 要求：
 1. 每图至少输出空集或命中类集合。
 2. 解析失败支持重试并记录失败原因。
-3. 若某图未命中任何类别，该图后续跳过 SAM。
-4. 场景级跳过：若场景目录下已存在 `vlm_desc/`，则该场景默认视为已处理并跳过。
-```bash
-# Qwen3-VL
-python Qwen3-VL/infer/batch_scene_classify.py \
-  --data-root benchmark \
-  --model-path Qwen/Qwen3-VL-2B-Thinking \
-  --max-new-tokens 1024 \
-  --use-coarse-classes
-
-# GLM-V
-python GLM-V/inference/batch_scene_classify_glm.py \
-  --data-root benchmark \
-  --model-path ZhipuAI/GLM-4.6V-Flash \
-  --max-new-tokens 1024
-```
+3. 若某图未命中任何类别，该图后续可跳过 SAM（按策略控制）。
 
 ### 任务4：SAM 批处理接入
 输入：
@@ -140,28 +134,12 @@ python GLM-V/inference/batch_scene_classify_glm.py \
 2. 类别来源可二选一：
    - 默认：每图固定 15 类文本全部推理（`--use-all-classes`）。
    - 可选：仅使用 `.vlm.txt` 命中类别（`--no-use-all-classes`）。
-3. 你的 SAM 推理代码（输出单个 `.npz`，含 `masks/boxes/scores`）。
 输出：`sam_mask/{img_stem}.npz`。
 要求：
 1. 无效实例（面积太小或分数过低）在回投阶段过滤。
 2. 场景级跳过：若场景目录下已存在 `sam_mask/`，则该场景默认视为已处理并跳过。
-```bash
-python sam3/preprocess/batch_scene_sam_from_vlm.py \
-  --data-root benchmark \
-  --alpha 0.45 \
-  --checkpoint sam3/model/sam3.pt \
-  --device cuda \
-  --sam-resolution 1008 \
-  --confidence-threshold 0.3 \
-  --use-all-classes
 
-# 如需额外按类别保存单独结果（便于排查）
-# python sam3/preprocess/batch_scene_sam_from_vlm.py --data-root benchmark --save-per-class-artifacts
-# 如需回退为“仅使用 vlm_desc 命中类别”模式
-# python sam3/preprocess/batch_scene_sam_from_vlm.py --data-root benchmark --no-use-all-classes
-```
-
-### 任务5：2D->3D 回投 + IoU合并 + 点冲突归属 + 去噪
+### 任务5：2D->3D 回投 + 合并 + 冲突归属 + 去噪 + 杆状物聚类
 输入：
 1. `projected_images/{img_stem}.npz`（`pts_img_indices`, `pts_indices`, `dist_img`）。
 2. `projected_images/effective_stations.json`（实际用于投影的相机外参）。
@@ -176,26 +154,25 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 5. 空间去噪（仅非树）：仅对 `class_id != 7` 的实例做空间聚类去噪，保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。树木实例在该步跳过去噪，统一由第 8/9 步树干-树冠后处理完成拆分与清理。
 6. 地面点剔除（非围栏）：对除围栏外的类别执行。按实例点云 `z` 值计算 `z_low = q05(z)` 与 `z_high = q95(z)`，并使用相对高度带 `[z_low + 0.2*(z_high-z_low), z_low + 0.8*(z_high-z_low)]` 的支撑点计算水平 `bbox`，向外扩 `2cm`。最终采用保守剔除：仅删除“低高度带（`z <= z_low + 0.2*(z_high-z_low)`）且位于 `bbox` 外”的点。
 7. 围栏重聚类：围栏实例不做上述 bbox 地面点剔除；先对整场景点云执行一次全局 CSF 提取地面掩码，然后仅在围栏分支删除“CSF 判地面且位于围栏实例低高度带（`z <= q05 + r*(q95-q05)`，`r` 为 `--fence-csf-low-band-ratio`）”的点，再把所有围栏非地面点合并后按 `XY` 连通重新聚类；仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
-8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 提取各 station 的位置与高度；对每棵树按 `XY` 质心匹配最近 station，并用该站点 `station_z - 2.0m` 作为该树的地面参考（station 信息异常时回退到全局默认值）。随后将所有树实例中离地 `0.8-1.4m` 的高度带点汇总，在 `XY` 平面执行 DBSCAN 生成树干候选簇。半径仍按该 `0.8-1.4m` 候选簇做 TaubinSVD 圆拟合（半径+残差门控）；高度改为从独立高度带（例如 `0.8-1.8m`）中补点，但补点范围仅限于“参与该候选树干簇合并的树实例”内部，且补点 `XY` 邻域半径固定为 `0.05m`；高度判定直接使用 `z_max - z_min`，并要求其大于 `tree-trunk-min-height`。当前版本已关闭主方向竖直性门控。
-9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。树木挂接完成后，对每棵树实例再做一次 3D DBSCAN（`--tree-final-denoise-eps`，默认 `0.5m`），仅保留最大连通簇，以去除误投影到远处墙体等离散噪点。
-
+8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 提取各 station 的位置与高度；对每棵树按 `XY` 质心匹配最近 station，并用该站点 `station_z - 2.0m` 作为该树的地面参考（station 信息异常时回退到全局默认值）。随后将所有树实例中离地 `0.8-1.4m` 的高度带点汇总，在 `XY` 平面执行 DBSCAN 生成树干候选簇。半径仍按该 `0.8-1.4m` 候选簇做 TaubinSVD 圆拟合（半径+残差门控）输出并固化 `dbh_m = 2 * r` 与 `trunk_center_xy`。结果写入 `tree_metrics.npz`，并与 `scene_instance_id` 一一对应；高度改为从独立高度带（例如 `0.8-1.8m`）中补点，但补点范围仅限于“参与该候选树干簇合并的树实例”内部，且补点 `XY` 邻域半径固定为 `0.05m`；高度判定直接使用 `z_max - z_min`，并要求其大于 `tree-trunk-min-height`。当前版本已关闭主方向竖直性门控。
+9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。树木挂接完成后，对每棵树实例再做一次 3D DBSCAN（`--tree-final-denoise-eps`，默认 `0.5m`），仅保留最大连通簇，以去除误投影到远处墙体等离散噪点。 
+10. 杆状物聚类（新增）：聚类对象是“点”，不是“实例中心”。从最终实例中提取 `class_id in {1,2,3,4,5,6}` 的全部点，投到 XY 平面执行 DBSCAN。默认参数：`eps=0.3`, `min_samples=10`。每个簇记为一个 `pole_group`，汇总 `candidate_class_ids`（来自与簇点相交的成员实例类别）。
+11. 杆状物聚类 LAS 导出（新增）：仅保存杆状物点。按 `pole_group_id` 着色（合并后的杆状物实例着色）。`classification=1`，`cls_id=1`，新增 extra dim：`pole_group_id`、`has_cls_1`、`has_cls_2`、`has_cls_3`、`has_cls_4`、`has_cls_5`、`has_cls_6`。其中 `has_cls_k`（`k=1..6`）规则为：若该合并实例（`pole_group`）包含类别 `k`，则写 `1`，否则写 `0`。
+12. `instance_seg_final.npz` 重组（新增约束）：`scene_instance` 仅保留 `7..15` 类（不再保留 `1..6` 的原始 scene_instance 记录）。`1..6` 仅通过 `pole_group` 表达。Task6 回溯点集时统一从该文件读取：`scene_instance_point_indices` 或 `pole_group_point_indices`。
 
 输出（每场景）：
-1. `fusion/{scene_name}_instance_seg.las`：当前 Task5 主流程输出，只包含实例点，按场景内实例 ID 随机着色。
-2. `fusion/{scene_name}_instance_seg_refined.las`：在主流程结果基础上，再经过地面点剔除和围栏重聚类后的 refined LAS。
-3. `fusion/{scene_name}_fence_csf_ground.las`：围栏分支实际用于去地面的点（全局 CSF 掩码与围栏低高度带联合后的有效地面点，`classification=2`），用于调试。
-4. `fusion/{scene_name}_instance_seg_tree_pre_denoise.las`：在“点冲突归属后、空间去噪前”导出的树木专用调试 LAS，仅包含 `class_id=7` 点，按实例 ID 着色，用于排查“多棵树被并到同一实例后仅保留最大簇”的问题。
-5. `fusion/{scene_name}_instance_seg_final.las`：在 refined 结果基础上，再经过树木树干/树冠后处理后的最终 LAS。
-6. `fusion/{scene_name}_instance_seg.npz`：主流程实例 ID、类别、置信度、实例点索引，以及点级唯一归属结果。
-7. `fusion/{scene_name}_instance_seg_final.npz`：最终树木后处理结果对应的实例点索引、类别和点级唯一归属结果。
-8. `fusion/{scene_name}_instance_seg_tree_trunks_height.las`：树干候选经过“稳健高度范围”过滤后的阶段 LAS。
-9. `fusion/{scene_name}_instance_seg_tree_trunks_radius.las`：在高度阶段基础上，再经过“水平稳健半径”过滤后的阶段 LAS。
-   以上 2 个 trunk LAS 都会写入额外字段：`trunk_height`、`trunk_radius`、`trunk_dir_x`、`trunk_dir_y`、`trunk_dir_z`、`trunk_dot_z`（以及 `cls_id`）。
-10. `fusion/{scene_name}_instance_seg_meta.json`：去噪/过滤统计日志。
+1. `fusion/{scene_name}_instance_seg.las`：主流程实例点 LAS。
+2. `fusion/{scene_name}_instance_seg_refined.las`：地面点剔除 + 围栏重聚类后结果。
+3. `fusion/{scene_name}_instance_seg_final.las`：树木后处理后的最终结果。
+4. `fusion/{scene_name}_instance_seg_final.npz`：统一封装 `scene_instance(7..15)` + `pole_group(1..6)`，并携带点级回溯索引。
+5. `fusion/{scene_name}_tree_metrics.npz`（新增）：每棵树 `dbh_m` 与 `trunk_center_xy`。
+6. `fusion/{scene_name}_pole_groups_merged.las`（新增）：仅杆状物聚类点云，按 `pole_group_id` 着色，并携带 `has_cls_1..has_cls_6` 六个二值字段。
+7. 现有调试文件继续保留：`*_fence_csf_ground.las`、`*_instance_seg_tree_pre_denoise.las`、`*_instance_seg_tree_trunks_*.las`、`*_instance_seg_meta.json`。
 
 默认场景级跳过：
 - 若 `fusion/` 已存在且非空，且未启用 `--overwrite`，则直接跳过该场景。
 
+示例（保留现有 Task5 完整参数，不删减；仅新增杆状物聚类参数）：
 ```bash
 python ImgProject/pipeline/task5_scene_instance_seg.py \
   --data-root benchmark \
@@ -230,108 +207,155 @@ python ImgProject/pipeline/task5_scene_instance_seg.py \
   --tree-trunk-max-residual 0.04 \
   --tree-crown-attach-distance 4.0 \
   --tree-final-denoise-eps 0.50 \
+  --pole-cluster-eps 0.3 \
+  --pole-cluster-min-samples 10 \
   --no-save-tree-pre-denoise-las \
-  --save-tree-trunk-anchors
-
-# 如需关闭树木去噪前调试导出：
-# ... --no-save-tree-pre-denoise-las
+  --save-tree-trunk-anchors \
+  --save-pole-groups-las
 ```
 
 ### 任务5.1：汇总各场景 Final LAS
-输入：
-1. `benchmark/{scene_name}/fusion/{scene_name}_instance_seg_final.las`（或 `fusion/*_instance_seg_final.las`）。
-
-输出：
-1. `benchmark/instance_seg_final_merged.las`（所有场景 final 实例点云拼接结果）。
-
+输入：`benchmark/{scene_name}/fusion/{scene_name}_instance_seg_final.las`。
+输出：`benchmark/instance_seg_final_merged.las`。
 要求：
 1. 按场景目录顺序读取并拼接。
-2. 默认保留点坐标、RGB、`classification`，并尽量保留 `cls_id`（若某输入缺失则回填 `classification`）。
-3. 若输出已存在且未开启 `--overwrite`，则直接报错，避免误覆盖。
-
-```bash
-python ImgProject/pipeline/task5_merge_instance_seg_final_las.py \
-  --data-root benchmark \
-  --output-name instance_seg_final_merged.las
-
-# 覆盖已有结果
-# python ImgProject/pipeline/task5_merge_instance_seg_final_las.py \
-#   --data-root benchmark \
-#   --output-name instance_seg_final_merged.las \
-#   --overwrite
-```
+2. 默认保留点坐标、RGB、`classification`，尽量保留 `cls_id`。
+3. 若输出已存在且未开启 `--overwrite`，直接报错避免误覆盖。
 
 ### 任务5.2：将 BEV prompt_results 转为独立 LAS
 输入：
-1. `sam3/benchmark/v1/prompt_results/las_positions.txt`（每个场景 BEV 图像左上角坐标）。
-2. `sam3/benchmark/v1/prompt_results/{concept}/*.npz`（`masks/boxes/scores`），例如 `arrow`、`lane_line`、`manhole`。
+1. `sam3/benchmark/v1/prompt_results/las_positions.txt`。
+2. `sam3/benchmark/v1/prompt_results/{concept}/*.npz`（如 `arrow`、`lane_line`、`manhole`）。
 3. BEV 分辨率（默认 `0.02m/pixel`）。
-
-处理：
-1. 逐实例读取 `masks`，将像素 `(row, col)` 按下式映射到世界坐标：
-   - `x = left_top_x + col * resolution`
-   - `y = left_top_y - row * resolution`
-   - `z = 3.5`（统一固定高度）
-2. 颜色规则：
-   - `arrow` 与 `lane_line` 使用同一种固定颜色。
-   - `manhole` 按实例随机颜色。
-3. 输出单个独立 LAS，不与任务5.1的 merged LAS 做拼接。
-
 输出：
 1. `sam3/benchmark/v1/prompt_results/arrow_lane_line_manhole_z3p5.las`（示例）。
 
-要求：
-1. 支持按 concept 子目录批量读取。
-2. 对于在 `las_positions.txt` 中找不到坐标的 `image_stem`，跳过并记录告警。
-3. 若输出已存在且未开启 `--overwrite`，直接报错避免误覆盖。
+### 任务6：要素属性提取（BEV 全局 + Front 场景）
+输入：
+1. BEV 全局输入（固定）：
+   - `benchmark/bev/global_instances.npz`
+   - `benchmark/bev/global_rgb.png`
+   - `benchmark/bev/las_positions.txt`
+2. Front 场景输入：
+   - `benchmark/{scene}/fusion/{scene}_instance_seg_final.npz`
+   - `benchmark/{scene}/fusion/{scene}_tree_metrics.npz`
+   - 场景 LAS + `projected_images/*.npz` + `effective_stations.json`
 
-```bash
-python ImgProject/pipeline/task5_prompt_results_to_las.py \
-  --prompt-results-dir sam3/benchmark/v1/prompt_results \
-  --las-positions sam3/benchmark/v1/prompt_results/las_positions.txt \
-  --concepts arrow lane_line manhole \
-  --resolution 0.02 \
-  --z 3.5 \
-  --seed 2026 \
-  --output sam3/benchmark/v1/prompt_results/arrow_lane_line_manhole_z3p5.las
+主流程：
+1. `run_bev_global()`：全图裁剪、井盖属性提取与几何计算，输出 BEV 全局属性文件。
+2. `run_front_by_scene()`：按场景生成 2 视图并做语义/几何属性提取，输出场景属性文件，再汇总全局。
 
-# 覆盖已有结果
-# python ImgProject/pipeline/task5_prompt_results_to_las.py \
-#   --prompt-results-dir sam3/benchmark/v1/prompt_results \
-#   --las-positions sam3/benchmark/v1/prompt_results/las_positions.txt \
-#   --concepts arrow lane_line manhole \
-#   --resolution 0.02 \
-#   --z 3.5 \
-#   --seed 2026 \
-#   --output sam3/benchmark/v1/prompt_results/arrow_lane_line_manhole_z3p5.las \
-#   --overwrite
-```
+实现约束：
+1. 主流程文件仅做编排：`task6_scene_attribute_extract.py`。
+2. GLM 调用/提示词/解析在 `task6_glm_utils.py`。
+3. 几何计算在 `task6_geometry_utils.py`。
 
-
-<!-- ### 任务6：跨场景边界实例合并
+#### 任务6A：BEV 全局分支
 处理：
-1. 仅在相邻场景 bbox overlap + margin 区域生成候选对。
-2. 候选实例按空间聚类与点云 IoU 判定是否合并。
-3. 合并后重建全局实例 ID。
+1. 不按场景拆分，直接在全图中裁剪。
+2. 井盖每实例输出两张图：局部图 + `500x500` 全局图。
+3. GLM 仅判断井盖：`functional_type`, `shape`。
+4. 井盖几何计算：最小外接圆，输出 `circle_center_xy`, `circle_radius_m`。
+
 输出：
-1. `cross_scene/boundary_candidates.json`
-2. `cross_scene/global_instances.npz`
-3. `cross_scene/global_point_assignment.npz`
-4. `cross_scene/global_instance_meta.json`
-要求：
-1. 避免全局 N² 比对，只处理边界候选。
-2. 全局实例 ID 稳定可复现。
-```bash
-python ImgProject/pipeline/task8_cross_scene_merge.py \
-  --data-root benchmark \
-  --boundary-margin 2.0 -->
+1. `benchmark/bev/bev_attributes_global.npz`
+2. `benchmark/bev/bev_attributes_global.json`
+
+#### 任务6B：Front 场景分支
+处理：
+1. 视角：每个目标只生成 2 张图：`0°(front)` 与 `+90°(side)`。
+2. `0°` 方向定义为“最近有效站点到目标质心的水平向量”；`+90°` 为绕 `Z` 轴旋转 90°。
+3. 成图策略复用任务2现有投影策略。
+4. 自适应裁剪：目标占图比例固定 `0.8`。
+   - `crop_w = bbox_w / 0.8`
+   - `crop_h = bbox_h / 0.8`
+5. 仅允许黑边补齐，不做 resize。
+
+语义属性范围（只保留你明确需要的键）：
+1. 杆状物组：
+   - `contains_classes`
+   - 若包含路灯杆：`arm_type`, `light_count`
+   - 若包含路牌/交通标志：`sign_shape`, `sign_color`, `sign_content`
+2. 树木：`tree_type`, `tree_trunk_visible`, `tree_pit`
+
+几何属性范围：
+1. 电线杆、路灯杆：`diameter_m`, `center_xy`, `height_m`
+2. 路牌、交通标志、红绿灯、监控：`centroid_xy`, `height_m`
+3. 行道树：读取 Task5 固化值 `dbh_m`, `trunk_center_xy`，并补 `height_m`
+4. 果壳箱、电箱：`length_m`, `width_m`, `height_m`
+
+几何计算口径：
+1. 地面高程：优先 CSF 地面邻域估计，缺失时回退 `q02(z)`。
+2. 高度：`height_m = q98(z - ground_z)`。
+3. 直径/DBH：在离地 `0.8-1.4m` 高度带做 TaubinSVD 圆拟合，`diameter = 2r`。
+4. 果壳箱/电箱长宽：XY 平面 PCA 主方向包围盒，定义 `length_m >= width_m`。
+
+输出（场景与全局）：
+1. 每场景：`benchmark/{scene}/attributes/{scene}_task6_front_attributes.npz|json`
+2. 全局汇总：`benchmark/attributes_global/task6_front_attributes_merged.npz|json`
+
+统一输出字段（NPZ/JSON 语义一致）：
+- `record_id`
+- `branch`（`bev`/`front`）
+- `scene_name`
+- `object_type`（`manhole`/`pole_group`/`scene_instance`）
+- `object_id`
+- `class_id`
+- `candidate_class_ids`
+- `semantic_attributes_json`
+- `geometry_attributes_json`
+- `evidence_json`
+- `confidence`
+
+回溯规则（Task6 -> 点云）：
+1. Front 分支结果统一按 `(scene_name, object_type, object_id)` 回溯到同场景 `fusion/{scene}_instance_seg_final.npz`。
+2. 当 `object_type=scene_instance` 时读取 `scene_instance_point_indices`。
+3. 当 `object_type=pole_group` 时读取 `pole_group_point_indices`。
+
+#### GLM 提示词示例
+井盖（BEV，局部+全局）：
+```text
+Picture 1 是井盖局部俯视图，Picture 2 是井盖所在区域全局俯视图。
+请判断：
+1) Functional Type: Rain/Sewage/Electric/Telecom/Gas/Water
+2) Shape: Round/Square
+只输出 JSON：
+{"functional_type":"...","shape":"...","confidence":0.0}
 ```
 
-## 假设与默认值
-1. VLM 固定使用 GLM。
-2. SAM 输出固定为每图一个 `.npz`，且可直接读取 `masks/boxes/scores`。
-3. 多场景 LAS 在同一坐标系下，可直接进行跨场景空间计算。
-4. 合并与聚类阈值统一放到配置中可调。
+杆状物组（Front，front+side）：
+```text
+Picture 1 是同一杆状物的 front 视图，Picture 2 是 side90 视图。
+候选类别仅限：[电线杆, 路灯杆, 路牌, 交通标志, 红绿灯, 监控]。
+请输出包含的类别（可多选），并按命中类别补充属性：
+- 路灯杆: arm_type, light_count
+- 路牌/交通标志: sign_shape, sign_color, sign_content
+只输出 JSON：
+{
+  "contains_classes": ["..."],
+  "arm_type": null,
+  "light_count": null,
+  "sign_shape": null,
+  "sign_color": null,
+  "sign_content": null,
+  "confidence": 0.0
+}
+```
 
-## 围栏 CSF 备选方案（后续）
-若实例级 CSF 在遮挡严重场景下仍不足以去掉“地面桥接”，后续可切换为“场景级全局 CSF”：每场景先跑一次全局地面分割，再在围栏分支按全局 ground mask 删除地面点，再做围栏重聚类。该方案通常更稳定，但计算开销更高。
+树木（Front，front+side）：
+```text
+Picture 1 是树木 front 视图，Picture 2 是 side90 视图。
+请判断 tree_type、tree_trunk_visible、tree_pit。
+只输出 JSON：
+{"tree_type":"...","tree_trunk_visible":"是/否","tree_pit":"是/否","confidence":0.0}
+```
+
+示例：
+```bash
+python ImgProject/pipeline/task6_scene_attribute_extract.py \
+  --data-root benchmark \
+  --task5-output-dir fusion \
+  --bev-dir benchmark/bev \
+  --target-fill-ratio 0.8 \
+  --model-path ZhipuAI/GLM-4.6V-Flash
+```
