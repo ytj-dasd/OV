@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +59,28 @@ def write_pole_groups_las(
         las_in=las_in,
         points_xyz=points_xyz,
         pole_groups=pole_groups,
+        random_seed=random_seed,
+    )
+
+
+def write_compact_final_scene_las(
+    *,
+    output_path: Path,
+    las_in: Any,
+    points_xyz: np.ndarray,
+    point_scene_instance_id: np.ndarray,
+    point_pole_group_id: np.ndarray,
+    scene_instance_class_id: np.ndarray,
+    random_seed: int,
+) -> int:
+    task5_utils.laspy = laspy
+    return task5_utils.write_compact_final_scene_las(
+        output_path=output_path,
+        las_in=las_in,
+        points_xyz=points_xyz,
+        point_scene_instance_id=point_scene_instance_id,
+        point_pole_group_id=point_pole_group_id,
+        scene_instance_class_id=scene_instance_class_id,
         random_seed=random_seed,
     )
 
@@ -148,6 +172,347 @@ def _build_tree_metrics_from_stage_clusters(
         )
 
     return metrics
+
+
+def _build_old_to_new_instance_id_map(
+    point_instance_id: np.ndarray,
+    *,
+    old_instance_count: int,
+) -> np.ndarray:
+    old_to_new = np.full((int(old_instance_count),), -1, dtype=np.int32)
+    if old_instance_count <= 0:
+        return old_to_new
+    present_old_ids = np.unique(np.asarray(point_instance_id, dtype=np.int32).reshape(-1))
+    present_old_ids = present_old_ids[present_old_ids >= 0]
+    if present_old_ids.size == 0:
+        return old_to_new
+    old_to_new[present_old_ids.astype(np.int64, copy=False)] = np.arange(
+        present_old_ids.size, dtype=np.int32
+    )
+    return old_to_new
+
+
+def _resolve_local_ground_z(
+    *,
+    xy_center: np.ndarray,
+    default_ground_z: float | None,
+    station_xy: np.ndarray | None,
+    station_ground_z: np.ndarray | None,
+) -> float | None:
+    local_ground_z = default_ground_z
+    if (
+        station_xy is not None
+        and station_ground_z is not None
+        and station_xy.shape[0] > 0
+        and station_ground_z.shape[0] == station_xy.shape[0]
+    ):
+        dists = np.linalg.norm(station_xy - xy_center[None, :], axis=1)
+        nearest_idx = int(np.argmin(dists))
+        nearest_ground_z = float(station_ground_z[nearest_idx])
+        if np.isfinite(nearest_ground_z):
+            local_ground_z = nearest_ground_z
+    if local_ground_z is None:
+        return None
+    if not np.isfinite(float(local_ground_z)):
+        return None
+    return float(local_ground_z)
+
+
+def _compute_pole_group_metrics(
+    *,
+    points_xyz: np.ndarray,
+    pole_groups: list[dict[str, Any]],
+    default_ground_z: float | None,
+    station_xy: np.ndarray | None,
+    station_ground_z: np.ndarray | None,
+    band_min: float,
+    band_max: float,
+) -> int:
+    low = min(float(band_min), float(band_max))
+    high = max(float(band_min), float(band_max))
+    num_points = int(points_xyz.shape[0])
+    valid_metrics = 0
+    for group in pole_groups:
+        group["diameter_m"] = float("nan")
+        group["center_xy"] = np.asarray([np.nan, np.nan], dtype=np.float32)
+        group["metric_source"] = "task5_pole_group_metric_unavailable"
+
+        points = np.unique(
+            np.asarray(group.get("point_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        )
+        if points.size < 3:
+            continue
+        valid = (points >= 0) & (points < num_points)
+        points = points[valid].astype(np.int32, copy=False)
+        if points.size < 3:
+            continue
+
+        xy_center = points_xyz[points.astype(np.int64, copy=False), :2].mean(axis=0)
+        local_ground_z = _resolve_local_ground_z(
+            xy_center=xy_center,
+            default_ground_z=default_ground_z,
+            station_xy=station_xy,
+            station_ground_z=station_ground_z,
+        )
+        if local_ground_z is None:
+            continue
+
+        z = points_xyz[points.astype(np.int64, copy=False), 2]
+        band_mask = (z >= float(local_ground_z) + low) & (z <= float(local_ground_z) + high)
+        band_points = points[band_mask].astype(np.int32, copy=False)
+        if band_points.size < 3:
+            continue
+
+        fit = _fit_circle_taubin_svd_xy(points_xyz[band_points.astype(np.int64, copy=False)])
+        if fit is None:
+            continue
+        center_xy, radius = fit
+        diameter_m = float(2.0 * float(radius))
+        if not np.isfinite(diameter_m) or diameter_m <= 0:
+            continue
+
+        group["diameter_m"] = diameter_m
+        group["center_xy"] = np.asarray(center_xy, dtype=np.float32).reshape(2)
+        group["metric_source"] = "task5_pole_group_band_taubin_svd"
+        valid_metrics += 1
+    return int(valid_metrics)
+
+
+def _filter_pole_groups_by_height_range(
+    *,
+    points_xyz: np.ndarray,
+    pole_groups: list[dict[str, Any]],
+    point_pole_group_id: np.ndarray,
+    min_height_diff_m: float,
+) -> tuple[list[dict[str, Any]], np.ndarray, dict[str, int]]:
+    num_points = int(points_xyz.shape[0])
+    source_point_group = np.asarray(point_pole_group_id, dtype=np.int32).reshape(-1)
+    if source_point_group.shape[0] != num_points:
+        fixed = np.full((num_points,), -1, dtype=np.int32)
+        copy_n = min(num_points, source_point_group.shape[0])
+        fixed[:copy_n] = source_point_group[:copy_n]
+        source_point_group = fixed
+
+    min_height = max(0.0, float(min_height_diff_m))
+    stats = {
+        "input_groups": int(len(pole_groups)),
+        "kept_groups": 0,
+        "dropped_groups": 0,
+        "dropped_points": 0,
+    }
+    if min_height <= 0:
+        return list(pole_groups), source_point_group.copy(), stats
+
+    kept_groups: list[dict[str, Any]] = []
+    point_group_out = np.full((num_points,), -1, dtype=np.int32)
+    for group in pole_groups:
+        points = np.unique(
+            np.asarray(group.get("point_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        )
+        if points.size == 0:
+            stats["dropped_groups"] += 1
+            continue
+        valid = (points >= 0) & (points < num_points)
+        points = points[valid].astype(np.int32, copy=False)
+        if points.size == 0:
+            stats["dropped_groups"] += 1
+            continue
+
+        z = points_xyz[points.astype(np.int64, copy=False), 2]
+        height_diff = float(np.max(z) - np.min(z))
+        if not np.isfinite(height_diff) or height_diff < min_height:
+            stats["dropped_groups"] += 1
+            stats["dropped_points"] += int(points.size)
+            continue
+
+        group_copy = dict(group)
+        new_pole_id = int(len(kept_groups))
+        group_copy["pole_id"] = new_pole_id
+        group_copy["height_diff_m"] = float(height_diff)
+        group_copy["point_indices"] = points.astype(np.int32, copy=False)
+        kept_groups.append(group_copy)
+        point_group_out[points.astype(np.int64, copy=False)] = new_pole_id
+
+    stats["kept_groups"] = int(len(kept_groups))
+    return kept_groups, point_group_out, stats
+
+
+def _filter_pole_groups_by_max_diameter(
+    *,
+    pole_groups: list[dict[str, Any]],
+    point_pole_group_id: np.ndarray,
+    num_points: int,
+    max_diameter_m: float,
+) -> tuple[list[dict[str, Any]], np.ndarray, dict[str, Any]]:
+    source_point_group = np.asarray(point_pole_group_id, dtype=np.int32).reshape(-1)
+    if source_point_group.shape[0] != int(num_points):
+        fixed = np.full((int(num_points),), -1, dtype=np.int32)
+        copy_n = min(int(num_points), source_point_group.shape[0])
+        fixed[:copy_n] = source_point_group[:copy_n]
+        source_point_group = fixed
+
+    threshold = float(max_diameter_m)
+    stats: dict[str, Any] = {
+        "input_groups": int(len(pole_groups)),
+        "kept_groups": 0,
+        "dropped_groups": 0,
+        "dropped_points": 0,
+        "max_diameter_m": threshold,
+    }
+    if (not np.isfinite(threshold)) or threshold <= 0.0:
+        stats["kept_groups"] = int(len(pole_groups))
+        return list(pole_groups), source_point_group.copy(), stats
+
+    kept_groups: list[dict[str, Any]] = []
+    point_group_out = np.full((int(num_points),), -1, dtype=np.int32)
+    for group in pole_groups:
+        points = np.unique(
+            np.asarray(group.get("point_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        )
+        valid = (points >= 0) & (points < int(num_points))
+        points = points[valid].astype(np.int32, copy=False)
+        if points.size == 0:
+            stats["dropped_groups"] += 1
+            continue
+
+        diameter_m = float(group.get("diameter_m", np.nan))
+        if np.isfinite(diameter_m) and diameter_m > threshold:
+            stats["dropped_groups"] += 1
+            stats["dropped_points"] += int(points.size)
+            continue
+
+        group_copy = dict(group)
+        new_pole_id = int(len(kept_groups))
+        group_copy["pole_id"] = new_pole_id
+        group_copy["point_indices"] = points.astype(np.int32, copy=False)
+        kept_groups.append(group_copy)
+        point_group_out[points.astype(np.int64, copy=False)] = new_pole_id
+
+    stats["kept_groups"] = int(len(kept_groups))
+    return kept_groups, point_group_out, stats
+
+
+def _drop_pseudo_tree_instances_by_pole_match(
+    *,
+    points_xyz: np.ndarray,
+    instances: list[SceneInstance],
+    point_instance_id: np.ndarray,
+    tree_metrics_old_ids: list[dict[str, Any]],
+    pole_groups: list[dict[str, Any]],
+    center_distance_max: float,
+    diameter_diff_max: float,
+) -> dict[str, int]:
+    stats = {
+        "candidate_pairs": 0,
+        "diameter_gate_rejected_pairs": 0,
+        "matched_pairs": 0,
+        "dropped_tree_instances": 0,
+        "dropped_tree_points": 0,
+    }
+    max_dist = float(center_distance_max)
+    if max_dist <= 0:
+        return stats
+    max_diameter_diff = float(diameter_diff_max)
+    use_diameter_gate = bool(np.isfinite(max_diameter_diff) and max_diameter_diff >= 0.0)
+
+    tree_centers: dict[int, np.ndarray] = {}
+    tree_diameter_m: dict[int, float] = {}
+    for item in tree_metrics_old_ids:
+        tree_old_id = int(item.get("scene_instance_id", -1))
+        if tree_old_id < 0 or tree_old_id >= len(instances):
+            continue
+        if int(instances[tree_old_id].class_id) != int(TREE_CLASS_ID):
+            continue
+        center = np.asarray(item.get("trunk_center_xy", np.asarray([np.nan, np.nan], dtype=np.float32)), dtype=np.float32).reshape(-1)
+        if center.size < 2:
+            continue
+        center_xy = center[:2].astype(np.float32, copy=False)
+        if not np.all(np.isfinite(center_xy)):
+            continue
+        tree_centers[tree_old_id] = center_xy
+        dbh_m = float(item.get("dbh_m", np.nan))
+        if np.isfinite(dbh_m) and dbh_m > 0:
+            tree_diameter_m[tree_old_id] = dbh_m
+    if not tree_centers:
+        return stats
+
+    pole_centers: dict[int, np.ndarray] = {}
+    pole_diameter_m: dict[int, float] = {}
+    for pole_id, group in enumerate(pole_groups):
+        center = np.asarray(group.get("center_xy", np.asarray([np.nan, np.nan], dtype=np.float32)), dtype=np.float32).reshape(-1)
+        if center.size < 2:
+            continue
+        center_xy = center[:2].astype(np.float32, copy=False)
+        if not np.all(np.isfinite(center_xy)):
+            continue
+        pole_centers[int(pole_id)] = center_xy
+        diameter_m = float(group.get("diameter_m", np.nan))
+        if np.isfinite(diameter_m) and diameter_m > 0:
+            pole_diameter_m[int(pole_id)] = diameter_m
+    if not pole_centers:
+        return stats
+
+    candidate_pairs: list[tuple[float, int, int]] = []
+    diameter_gate_rejected = 0
+    for tree_old_id, tree_center in tree_centers.items():
+        for pole_id, pole_center in pole_centers.items():
+            dist = float(np.linalg.norm(tree_center - pole_center))
+            if dist > max_dist:
+                continue
+            if use_diameter_gate:
+                tree_d = float(tree_diameter_m.get(int(tree_old_id), np.nan))
+                pole_d = float(pole_diameter_m.get(int(pole_id), np.nan))
+                if (not np.isfinite(tree_d)) or (not np.isfinite(pole_d)):
+                    diameter_gate_rejected += 1
+                    continue
+                if abs(tree_d - pole_d) > max_diameter_diff:
+                    diameter_gate_rejected += 1
+                    continue
+            candidate_pairs.append((dist, int(tree_old_id), int(pole_id)))
+    stats["diameter_gate_rejected_pairs"] = int(diameter_gate_rejected)
+    if not candidate_pairs:
+        return stats
+
+    candidate_pairs.sort(key=lambda item: (float(item[0]), int(item[1]), int(item[2])))
+    stats["candidate_pairs"] = int(len(candidate_pairs))
+
+    assigned_tree_ids: set[int] = set()
+    assigned_pole_ids: set[int] = set()
+    matched_pairs: list[tuple[int, int]] = []
+    for _, tree_old_id, pole_id in candidate_pairs:
+        if tree_old_id in assigned_tree_ids or pole_id in assigned_pole_ids:
+            continue
+        assigned_tree_ids.add(tree_old_id)
+        assigned_pole_ids.add(pole_id)
+        matched_pairs.append((int(tree_old_id), int(pole_id)))
+    if not matched_pairs:
+        return stats
+
+    num_points = int(points_xyz.shape[0])
+    dropped_tree_instances = 0
+    dropped_tree_points = 0
+    for tree_old_id, _pole_id in matched_pairs:
+        tree_points = np.unique(
+            np.asarray(instances[tree_old_id].point_indices, dtype=np.int32).reshape(-1)
+        )
+        if tree_points.size == 0:
+            continue
+        valid = (tree_points >= 0) & (tree_points < num_points)
+        tree_points = tree_points[valid].astype(np.int32, copy=False)
+        if tree_points.size == 0:
+            continue
+
+        tree_points_i64 = tree_points.astype(np.int64, copy=False)
+        point_instance_id[tree_points_i64] = -1
+        instances[tree_old_id].point_indices = np.zeros((0,), dtype=np.int32)
+
+        dropped_tree_instances += 1
+        dropped_tree_points += int(tree_points.size)
+
+    stats["matched_pairs"] = int(len(matched_pairs))
+    stats["dropped_tree_instances"] = int(dropped_tree_instances)
+    stats["dropped_tree_points"] = int(dropped_tree_points)
+    return stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -366,13 +731,55 @@ def parse_args() -> argparse.Namespace:
         "--pole-cluster-eps",
         type=float,
         default=0.30,
-        help="DBSCAN eps in XY for merged pole-group clustering on final classes 1-6 points.",
+        help="DBSCAN eps in 3D for merged pole-group clustering on final classes 1-6 points.",
     )
     parser.add_argument(
         "--pole-cluster-min-samples",
         type=int,
         default=10,
         help="DBSCAN min_samples for merged pole-group clustering on final classes 1-6 points.",
+    )
+    parser.add_argument(
+        "--pole-min-cluster-points",
+        type=int,
+        default=100,
+        help="Drop pole-group clusters whose point count is below this value.",
+    )
+    parser.add_argument(
+        "--pole-min-height-diff",
+        type=float,
+        default=0.50,
+        help="Drop pole-group clusters whose z-range (z_max-z_min) is below this value (meters).",
+    )
+    parser.add_argument(
+        "--pole-metric-band-min",
+        type=float,
+        default=0.80,
+        help="Lower height above local ground used for pole-group diameter/center fitting.",
+    )
+    parser.add_argument(
+        "--pole-metric-band-max",
+        type=float,
+        default=1.40,
+        help="Upper height above local ground used for pole-group diameter/center fitting.",
+    )
+    parser.add_argument(
+        "--tree-pole-center-merge-distance",
+        type=float,
+        default=0.35,
+        help="Drop a pseudo-tree instance when its trunk center is uniquely matched to a pole_group center within this threshold (meters).",
+    )
+    parser.add_argument(
+        "--tree-pole-diameter-diff-max",
+        type=float,
+        default=0.30,
+        help="Additional pseudo-tree gate: require |tree_dbh - pole_diameter| <= this threshold (meters).",
+    )
+    parser.add_argument(
+        "--pole-max-diameter-m",
+        type=float,
+        default=5.0,
+        help="Drop pole-group clusters whose fitted diameter exceeds this value (meters). <=0 disables this filter.",
     )
     parser.add_argument(
         "--save-tree-trunk-anchors",
@@ -399,6 +806,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing {scene}_instance_seg outputs.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=2,
+        help="Number of scenes to process in parallel. Set to 1 for serial mode to reduce memory usage.",
+    )
     return parser.parse_args()
 
 
@@ -415,9 +828,10 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     scene_npz_path = output_dir / f"{scene_name}_instance_seg.npz"
     scene_las_path = output_dir / f"{scene_name}_instance_seg.las"
     scene_refined_las_path = output_dir / f"{scene_name}_instance_seg_refined.las"
-    scene_fence_csf_ground_las_path = output_dir / f"{scene_name}_fence_csf_ground.las"
+    scene_csf_ground_las_path = output_dir / f"{scene_name}_scene_csf_ground.las"
     scene_tree_pre_denoise_las_path = output_dir / f"{scene_name}_instance_seg_tree_pre_denoise.las"
     scene_final_npz_path = output_dir / f"{scene_name}_instance_seg_final.npz"
+    scene_final_pre_pole_las_path = output_dir / f"{scene_name}_instance_seg_final_pre_pole.las"
     scene_final_las_path = output_dir / f"{scene_name}_instance_seg_final.las"
     scene_pole_groups_merged_las_path = output_dir / f"{scene_name}_pole_groups_merged.las"
     scene_tree_metrics_npz_path = output_dir / f"{scene_name}_tree_metrics.npz"
@@ -434,9 +848,10 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         and scene_npz_path.exists()
         and scene_las_path.exists()
         and scene_refined_las_path.exists()
-        and scene_fence_csf_ground_las_path.exists()
+        and scene_csf_ground_las_path.exists()
         and (not save_tree_pre_denoise_las or scene_tree_pre_denoise_las_path.exists())
         and scene_final_npz_path.exists()
+        and scene_final_pre_pole_las_path.exists()
         and scene_final_las_path.exists()
         and scene_tree_metrics_npz_path.exists()
         and (not save_pole_groups_las or scene_pole_groups_merged_las_path.exists())
@@ -451,9 +866,11 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
             "scene_npz": str(scene_npz_path),
             "scene_las": str(scene_las_path),
             "scene_refined_las": str(scene_refined_las_path),
-            "scene_fence_csf_ground_las": str(scene_fence_csf_ground_las_path),
+            "scene_csf_ground_las": str(scene_csf_ground_las_path),
+            "scene_fence_csf_ground_las": str(scene_csf_ground_las_path),
             "scene_tree_pre_denoise_las": str(scene_tree_pre_denoise_las_path) if save_tree_pre_denoise_las else None,
             "scene_final_npz": str(scene_final_npz_path),
+            "scene_final_pre_pole_las": str(scene_final_pre_pole_las_path),
             "scene_final_las": str(scene_final_las_path),
             "scene_tree_metrics_npz": str(scene_tree_metrics_npz_path),
             "scene_pole_groups_merged_las": str(scene_pole_groups_merged_las_path) if save_pole_groups_las else None,
@@ -597,16 +1014,16 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         instances=refined_instances,
         random_seed=int(args.random_seed),
     )
-    fence_ground_point_indices = (
+    scene_ground_point_indices = (
         np.where(fence_global_ground_mask)[0].astype(np.int32, copy=False)
         if isinstance(fence_global_ground_mask, np.ndarray) and fence_global_ground_mask.shape[0] == points_xyz.shape[0]
         else np.zeros((0,), dtype=np.int32)
     )
-    selected_points_fence_csf_ground = write_point_subset_las(
-        output_path=scene_fence_csf_ground_las_path,
+    selected_points_scene_csf_ground = write_point_subset_las(
+        output_path=scene_csf_ground_las_path,
         las_in=las_data,
         points_xyz=points_xyz,
-        point_indices=fence_ground_point_indices,
+        point_indices=scene_ground_point_indices,
         classification=2,
         rgb8=(90, 200, 90),
     )
@@ -618,7 +1035,7 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         f"fence_global_csf_applied={int(refine_stats.get('fence_global_csf_applied', refine_stats.get('fence_csf_instances_applied', 0)))} "
         f"fence_csf_removed={int(refine_stats.get('fence_csf_removed_points_total', 0))} "
         f"fence_effective_ground={int(refine_stats.get('fence_effective_ground_points_total', 0))} "
-        f"fence_global_ground_points={selected_points_fence_csf_ground} "
+        f"scene_csf_ground_points={selected_points_scene_csf_ground} "
         f"final_instances={len(refined_instances)} final_points={selected_points_refined}"
     )
 
@@ -649,64 +1066,21 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         tree_final_denoise_eps=float(getattr(args, "tree_final_denoise_eps", 0.50)),
         return_trunk_stage_clusters=True,
     )
-
-    selected_points_final = write_scene_las(
-        output_path=scene_final_las_path,
-        las_in=las_data,
-        points_xyz=points_xyz,
-        point_instance_id=final_point_instance_id,
-        instances=final_instances,
-        random_seed=int(args.random_seed),
+    print(
+        f"[{scene_name}] step done: tree_refine "
+        f"final_tree_instances={len(final_instances)} "
+        f"trunk_candidate_groups={int(tree_stats.get('trunk_candidate_groups', 0))} "
+        f"trunk_anchors={int(tree_stats.get('trunk_anchors', 0))}"
     )
 
-    pole_groups, point_pole_group_id = build_pole_groups(
-        points_xyz=points_xyz,
-        instances=final_instances,
-        eps=float(getattr(args, "pole_cluster_eps", 0.30)),
-        min_samples=int(getattr(args, "pole_cluster_min_samples", 10)),
-    )
-    selected_points_pole_groups = 0
-    if save_pole_groups_las:
-        selected_points_pole_groups = write_pole_groups_las(
-            output_path=scene_pole_groups_merged_las_path,
-            las_in=las_data,
-            points_xyz=points_xyz,
-            pole_groups=pole_groups,
-            random_seed=int(args.random_seed),
-        )
-
-    final_point_confidence = np.where(final_point_instance_id >= 0, 1.0, 0.0).astype(np.float32, copy=False)
-    save_scene_npz(
-        output_path=scene_final_npz_path,
-        scene_name=scene_name,
-        instances=final_instances,
-        point_instance_id=final_point_instance_id,
-        point_confidence=final_point_confidence,
-        pole_groups=pole_groups,
-        point_pole_group_id=point_pole_group_id,
-        scene_instance_class_min=7,
-    )
-    old_to_scene_instance = _build_scene_instance_id_map(final_instances, class_min=7)
     tree_metrics_old_ids = _build_tree_metrics_from_stage_clusters(
         points_xyz=points_xyz,
         instances=final_instances,
         trunk_stage_clusters=trunk_stage_clusters,
     )
-    tree_metrics: list[dict[str, Any]] = []
-    for item in tree_metrics_old_ids:
-        old_id = int(item.get("scene_instance_id", -1))
-        if old_id < 0 or old_id >= old_to_scene_instance.shape[0]:
-            continue
-        scene_instance_id = int(old_to_scene_instance[old_id])
-        if scene_instance_id < 0:
-            continue
-        item_copy = dict(item)
-        item_copy["scene_instance_id"] = int(scene_instance_id)
-        tree_metrics.append(item_copy)
-    save_tree_metrics_npz(
-        output_path=scene_tree_metrics_npz_path,
-        scene_name=scene_name,
-        tree_metrics=tree_metrics,
+    print(
+        f"[{scene_name}] step done: tree_metric_candidates "
+        f"count={len(tree_metrics_old_ids)}"
     )
 
     selected_points_tree_trunks_height = 0
@@ -726,6 +1100,200 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
             stage_clusters=trunk_stage_clusters.get('radius', []),
             random_seed=int(args.random_seed),
         )
+        print(
+            f"[{scene_name}] step done: write_tree_trunk_stage_las "
+            f"height_points={selected_points_tree_trunks_height} "
+            f"radius_points={selected_points_tree_trunks_radius}"
+        )
+    else:
+        print(
+            f"[{scene_name}] step done: skip_write_tree_trunk_stage_las "
+            f"reason=save_tree_trunk_anchors_false"
+        )
+
+    # Release heavy intermediate clusters before pole-group clustering.
+    trunk_stage_clusters.clear()
+    del trunk_stage_clusters
+    gc.collect()
+    print(f"[{scene_name}] step done: release_tree_intermediates")
+
+    selected_points_final_pre_pole = write_scene_las(
+        output_path=scene_final_pre_pole_las_path,
+        las_in=las_data,
+        points_xyz=points_xyz,
+        point_instance_id=final_point_instance_id,
+        instances=final_instances,
+        random_seed=int(args.random_seed),
+    )
+    print(
+        f"[{scene_name}] step done: write_final_pre_pole_las "
+        f"points={selected_points_final_pre_pole} path={scene_final_pre_pole_las_path.name}"
+    )
+
+    pole_groups, point_pole_group_id = build_pole_groups(
+        points_xyz=points_xyz,
+        instances=final_instances,
+        eps=float(getattr(args, "pole_cluster_eps", 0.30)),
+        min_samples=int(getattr(args, "pole_cluster_min_samples", 10)),
+        min_cluster_points=int(getattr(args, "pole_min_cluster_points", 100)),
+    )
+    raw_pole_group_count = int(len(pole_groups))
+    pole_groups, point_pole_group_id, pole_height_filter_stats = _filter_pole_groups_by_height_range(
+        points_xyz=points_xyz,
+        pole_groups=pole_groups,
+        point_pole_group_id=point_pole_group_id,
+        min_height_diff_m=float(getattr(args, "pole_min_height_diff", 0.50)),
+    )
+    pole_metrics_valid_before_merge = _compute_pole_group_metrics(
+        points_xyz=points_xyz,
+        pole_groups=pole_groups,
+        default_ground_z=tree_ground_z,
+        station_xy=tree_station_xy,
+        station_ground_z=tree_station_ground_z,
+        band_min=float(getattr(args, "pole_metric_band_min", 0.80)),
+        band_max=float(getattr(args, "pole_metric_band_max", 1.40)),
+    )
+    pole_groups, point_pole_group_id, pole_diameter_filter_stats = _filter_pole_groups_by_max_diameter(
+        pole_groups=pole_groups,
+        point_pole_group_id=point_pole_group_id,
+        num_points=num_points,
+        max_diameter_m=float(getattr(args, "pole_max_diameter_m", 5.0)),
+    )
+    pole_metrics_valid_after_diameter = int(
+        sum(
+            1
+            for group in pole_groups
+            if np.isfinite(float(group.get("diameter_m", np.nan))) and float(group.get("diameter_m", np.nan)) > 0.0
+        )
+    )
+    print(
+        f"[{scene_name}] step done: build_pole_groups "
+        f"raw_groups={raw_pole_group_count} "
+        f"groups={len(pole_groups)} "
+        f"dropped_by_height={int(pole_height_filter_stats.get('dropped_groups', 0))} "
+        f"dropped_by_diameter={int(pole_diameter_filter_stats.get('dropped_groups', 0))} "
+        f"metrics_ready={pole_metrics_valid_after_diameter}"
+    )
+
+    pseudo_tree_drop_stats = _drop_pseudo_tree_instances_by_pole_match(
+        points_xyz=points_xyz,
+        instances=final_instances,
+        point_instance_id=final_point_instance_id,
+        tree_metrics_old_ids=tree_metrics_old_ids,
+        pole_groups=pole_groups,
+        center_distance_max=float(getattr(args, "tree_pole_center_merge_distance", 0.35)),
+        diameter_diff_max=float(getattr(args, "tree_pole_diameter_diff_max", 0.30)),
+    )
+    old_to_new_after_pseudo = _build_old_to_new_instance_id_map(
+        final_point_instance_id,
+        old_instance_count=len(final_instances),
+    )
+    final_instances = rebuild_instances(final_instances, final_point_instance_id)
+    pole_metrics_valid_after_drop = int(pole_metrics_valid_after_diameter)
+    print(
+        f"[{scene_name}] step done: pseudo_tree_drop "
+        f"candidate_pairs={int(pseudo_tree_drop_stats.get('candidate_pairs', 0))} "
+        f"diameter_gate_rejected_pairs={int(pseudo_tree_drop_stats.get('diameter_gate_rejected_pairs', 0))} "
+        f"matched_pairs={int(pseudo_tree_drop_stats.get('matched_pairs', 0))} "
+        f"dropped_tree_instances={int(pseudo_tree_drop_stats.get('dropped_tree_instances', 0))} "
+        f"dropped_tree_points={int(pseudo_tree_drop_stats.get('dropped_tree_points', 0))} "
+        f"pole_metrics_ready={pole_metrics_valid_after_drop}"
+    )
+
+    old_to_scene_instance = _build_scene_instance_id_map(final_instances, class_min=7)
+    tree_metrics: list[dict[str, Any]] = []
+    for item in tree_metrics_old_ids:
+        old_id = int(item.get("scene_instance_id", -1))
+        if old_id < 0 or old_id >= old_to_new_after_pseudo.shape[0]:
+            continue
+        new_old_id = int(old_to_new_after_pseudo[old_id])
+        if new_old_id < 0 or new_old_id >= len(final_instances):
+            continue
+        if int(final_instances[new_old_id].class_id) != int(TREE_CLASS_ID):
+            continue
+        scene_instance_id = int(old_to_scene_instance[new_old_id])
+        if scene_instance_id < 0:
+            continue
+        item_copy = dict(item)
+        item_copy["scene_instance_id"] = int(scene_instance_id)
+        tree_metrics.append(item_copy)
+
+    selected_points_pole_groups = 0
+    if save_pole_groups_las:
+        selected_points_pole_groups = write_pole_groups_las(
+            output_path=scene_pole_groups_merged_las_path,
+            las_in=las_data,
+            points_xyz=points_xyz,
+            pole_groups=pole_groups,
+            random_seed=int(args.random_seed),
+        )
+        print(
+            f"[{scene_name}] step done: write_pole_groups_las "
+            f"points={selected_points_pole_groups} path={scene_pole_groups_merged_las_path.name}"
+        )
+    else:
+        print(
+            f"[{scene_name}] step done: skip_write_pole_groups_las "
+            f"reason=save_pole_groups_las_false"
+        )
+
+    point_pole_group_id_compact = np.asarray(point_pole_group_id, dtype=np.int32).reshape(-1)
+    if point_pole_group_id_compact.shape[0] != num_points:
+        fixed = np.full((num_points,), -1, dtype=np.int32)
+        copy_n = min(num_points, point_pole_group_id_compact.shape[0])
+        fixed[:copy_n] = point_pole_group_id_compact[:copy_n]
+        point_pole_group_id_compact = fixed
+
+    final_point_confidence = np.where(
+        (final_point_instance_id >= 0) | (point_pole_group_id_compact >= 0),
+        1.0,
+        0.0,
+    ).astype(np.float32, copy=False)
+    save_scene_npz(
+        output_path=scene_final_npz_path,
+        scene_name=scene_name,
+        instances=final_instances,
+        point_instance_id=final_point_instance_id,
+        point_confidence=final_point_confidence,
+        pole_groups=pole_groups,
+        point_pole_group_id=point_pole_group_id_compact,
+        scene_instance_class_min=7,
+    )
+    print(
+        f"[{scene_name}] step done: save_final_npz "
+        f"path={scene_final_npz_path.name}"
+    )
+    scene_instance_class_id = np.asarray(
+        [int(inst.class_id) for inst in final_instances if int(inst.class_id) >= 7],
+        dtype=np.int32,
+    )
+    point_scene_instance_id = np.full((num_points,), -1, dtype=np.int32)
+    for old_id, new_id in enumerate(old_to_scene_instance):
+        if int(new_id) < 0:
+            continue
+        point_scene_instance_id[final_point_instance_id == int(old_id)] = int(new_id)
+    selected_points_final = write_compact_final_scene_las(
+        output_path=scene_final_las_path,
+        las_in=las_data,
+        points_xyz=points_xyz,
+        point_scene_instance_id=point_scene_instance_id,
+        point_pole_group_id=point_pole_group_id_compact,
+        scene_instance_class_id=scene_instance_class_id,
+        random_seed=int(args.random_seed),
+    )
+    print(
+        f"[{scene_name}] step done: write_compact_final_las "
+        f"points={selected_points_final} path={scene_final_las_path.name}"
+    )
+    save_tree_metrics_npz(
+        output_path=scene_tree_metrics_npz_path,
+        scene_name=scene_name,
+        tree_metrics=tree_metrics,
+    )
+    print(
+        f"[{scene_name}] step done: save_tree_metrics "
+        f"count={len(tree_metrics)} path={scene_tree_metrics_npz_path.name}"
+    )
 
     print(
         f"[{scene_name}] tree postprocess: ground_z={tree_ground_z if tree_ground_z is not None else 'none'} "
@@ -735,12 +1303,15 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         f"attached={int(tree_stats['pending_crowns_attached'])} kept={int(tree_stats['pending_crowns_kept'])} dropped={int(tree_stats.get('pending_crowns_dropped', 0))} "
         f"tree_final_denoise_removed={int(tree_stats.get('tree_final_denoise_removed_points', 0))} "
         f"tree_final_denoise_touched={int(tree_stats.get('tree_final_denoise_touched_instances', 0))} "
-        f"final_instances={len(final_instances)} final_points={selected_points_final} "
+        f"final_instances={len(final_instances)} final_points_pre_pole={selected_points_final_pre_pole} "
+        f"final_points_compact={selected_points_final} "
         f"trunk_points(height/radius)={selected_points_tree_trunks_height}/{selected_points_tree_trunks_radius}"
     )
     print(
         f"[{scene_name}] pole groups: groups={len(pole_groups)} points={selected_points_pole_groups} "
-        f"tree_metrics={len(tree_metrics)}"
+        f"dropped_by_height={int(pole_height_filter_stats.get('dropped_groups', 0))} "
+        f"dropped_by_diameter={int(pole_diameter_filter_stats.get('dropped_groups', 0))} "
+        f"tree_metrics={len(tree_metrics)} pseudo_tree_dropped={int(pseudo_tree_drop_stats.get('dropped_tree_instances', 0))}"
     )
 
     meta = {
@@ -749,14 +1320,23 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         "num_points": num_points,
         "candidate_stats": candidate_stats,
         "merged_instance_count_before_denoise": int(candidate_to_instance.max() + 1) if candidate_to_instance.size > 0 else 0,
-        "final_instance_count": len(instances),
+        "final_instance_count": len(final_instances),
         "selected_instance_points": selected_points,
         "selected_instance_points_refined": selected_points_refined,
-        "selected_fence_csf_ground_points": selected_points_fence_csf_ground,
+        "selected_scene_csf_ground_points": selected_points_scene_csf_ground,
+        "selected_fence_csf_ground_points": selected_points_scene_csf_ground,
         "selected_tree_pre_denoise_points": selected_points_tree_pre_denoise,
+        "selected_instance_points_final_pre_pole": selected_points_final_pre_pole,
         "selected_instance_points_final": selected_points_final,
         "selected_pole_group_points": selected_points_pole_groups,
         "pole_group_count": int(len(pole_groups)),
+        "pole_height_filter": pole_height_filter_stats,
+        "pole_diameter_filter": pole_diameter_filter_stats,
+        "pole_metric_valid_groups_before_pseudo_merge": int(pole_metrics_valid_before_merge),
+        "pole_metric_valid_groups_after_diameter_filter": int(pole_metrics_valid_after_diameter),
+        "pole_metric_valid_groups_after_pseudo_drop": int(pole_metrics_valid_after_drop),
+        "pole_metric_valid_groups_after_pseudo_merge": int(pole_metrics_valid_after_drop),
+        "pseudo_tree_drop": pseudo_tree_drop_stats,
         "tree_metric_count": int(len(tree_metrics)),
         "selected_tree_trunk_points": selected_points_tree_trunks_radius,
         "selected_tree_trunk_points_height": selected_points_tree_trunks_height,
@@ -769,9 +1349,11 @@ def process_scene(scene_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
         "scene_npz": str(scene_npz_path),
         "scene_las": str(scene_las_path),
         "scene_refined_las": str(scene_refined_las_path),
-        "scene_fence_csf_ground_las": str(scene_fence_csf_ground_las_path),
+        "scene_csf_ground_las": str(scene_csf_ground_las_path),
+        "scene_fence_csf_ground_las": str(scene_csf_ground_las_path),
         "scene_tree_pre_denoise_las": str(scene_tree_pre_denoise_las_path) if save_tree_pre_denoise_las else None,
         "scene_final_npz": str(scene_final_npz_path),
+        "scene_final_pre_pole_las": str(scene_final_pre_pole_las_path),
         "scene_final_las": str(scene_final_las_path),
         "scene_tree_metrics_npz": str(scene_tree_metrics_npz_path),
         "scene_pole_groups_merged_las": str(scene_pole_groups_merged_las_path) if save_pole_groups_las else None,
@@ -793,9 +1375,29 @@ def main() -> None:
     if not scene_dirs:
         raise FileNotFoundError(f"No scene directories with projected_images under: {data_root}")
 
-    for scene_dir in scene_dirs:
-        result = process_scene(scene_dir, args)
-        print(f"[{result.get('status', 'unknown')}] {scene_dir.name}")
+    num_workers = max(1, int(getattr(args, "num_workers", 2)))
+    if num_workers == 1 or len(scene_dirs) == 1:
+        for scene_dir in scene_dirs:
+            result = process_scene(scene_dir, args)
+            print(f"[{result.get('status', 'unknown')}] {scene_dir.name}")
+        print("done.")
+        return
+
+    failed_scenes = 0
+    max_workers = min(num_workers, len(scene_dirs))
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_scene = {executor.submit(process_scene, scene_dir, args): scene_dir for scene_dir in scene_dirs}
+        for future in as_completed(future_to_scene):
+            scene_dir = future_to_scene[future]
+            try:
+                result = future.result()
+                print(f"[{result.get('status', 'unknown')}] {scene_dir.name}")
+            except Exception as exc:
+                failed_scenes += 1
+                print(f"[failed_exception] {scene_dir.name}: {exc}")
+
+    if failed_scenes > 0:
+        raise RuntimeError(f"Task5 parallel run failed on {failed_scenes} scene(s).")
     print("done.")
 
 

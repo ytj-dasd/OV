@@ -59,6 +59,24 @@ SIGN_LIKE_CLASS_IDS = frozenset({3, 4, 5, 6})
 
 GROUND_FILTER_CLASS_IDS = frozenset({1, 2, 8, 9, 11, 12, 13, 14, 15})
 
+GLOBAL_GID_SCENE_BITS = 10
+GLOBAL_GID_TYPE_BITS = 1
+GLOBAL_GID_OBJECT_BITS = 14
+
+GLOBAL_GID_SCENE_MAX = (1 << GLOBAL_GID_SCENE_BITS) - 1
+GLOBAL_GID_OBJECT_MAX = (1 << GLOBAL_GID_OBJECT_BITS) - 1
+GLOBAL_GID_TYPE_MAX = (1 << GLOBAL_GID_TYPE_BITS) - 1
+
+GLOBAL_GID_TYPE_SCENE_INSTANCE = 0
+GLOBAL_GID_TYPE_POLE_GROUP = 1
+
+GLOBAL_GID_OBJECT_MASK = (1 << GLOBAL_GID_OBJECT_BITS) - 1
+GLOBAL_GID_TYPE_MASK = (1 << GLOBAL_GID_TYPE_BITS) - 1
+GLOBAL_GID_SCENE_MASK = (1 << GLOBAL_GID_SCENE_BITS) - 1
+
+GLOBAL_GID_TYPE_SHIFT = GLOBAL_GID_OBJECT_BITS
+GLOBAL_GID_SCENE_SHIFT = GLOBAL_GID_OBJECT_BITS + GLOBAL_GID_TYPE_BITS
+
 @dataclass
 class CandidateInstance:
     image_stem: str
@@ -109,6 +127,67 @@ def discover_scene_dirs(data_root: Path) -> list[Path]:
         if child.is_dir() and (child / "projected_images").is_dir():
             scene_dirs.append(child)
     return scene_dirs
+
+
+def build_scene_id_map(data_root: Path) -> dict[str, int]:
+    scene_dirs = discover_scene_dirs(data_root)
+    if len(scene_dirs) > int(GLOBAL_GID_SCENE_MAX + 1):
+        raise ValueError(
+            f"Too many scenes for global_gid scene bits: "
+            f"{len(scene_dirs)} > {int(GLOBAL_GID_SCENE_MAX + 1)}"
+        )
+    return {scene_dir.name: int(idx) for idx, scene_dir in enumerate(scene_dirs)}
+
+
+def object_type_to_code(object_type: str) -> int:
+    obj_type = str(object_type).strip().lower()
+    if obj_type == "scene_instance":
+        return int(GLOBAL_GID_TYPE_SCENE_INSTANCE)
+    if obj_type == "pole_group":
+        return int(GLOBAL_GID_TYPE_POLE_GROUP)
+    raise ValueError(f"Unsupported object_type for global_gid: {object_type}")
+
+
+def object_code_to_type(type_code: int) -> str:
+    code = int(type_code)
+    if code == int(GLOBAL_GID_TYPE_SCENE_INSTANCE):
+        return "scene_instance"
+    if code == int(GLOBAL_GID_TYPE_POLE_GROUP):
+        return "pole_group"
+    raise ValueError(f"Unsupported type_code for global_gid: {type_code}")
+
+
+def encode_global_gid(*, scene_id: int, object_type: str, object_id: int) -> int:
+    sid = int(scene_id)
+    oid = int(object_id)
+    if sid < 0 or sid > int(GLOBAL_GID_SCENE_MAX):
+        raise ValueError(f"scene_id out of range for global_gid: {sid}")
+    if oid < 0 or oid > int(GLOBAL_GID_OBJECT_MAX):
+        raise ValueError(f"object_id out of range for global_gid: {oid}")
+    type_code = object_type_to_code(object_type)
+    gid = (
+        (sid << int(GLOBAL_GID_SCENE_SHIFT))
+        | (int(type_code) << int(GLOBAL_GID_TYPE_SHIFT))
+        | oid
+    )
+    if gid < 0 or gid > np.iinfo(np.int32).max:
+        raise ValueError(f"global_gid out of int32 positive range: {gid}")
+    return int(gid)
+
+
+def decode_global_gid(global_gid: int) -> dict[str, int | str]:
+    gid = int(global_gid)
+    if gid < 0:
+        raise ValueError(f"global_gid must be non-negative: {gid}")
+    object_id = gid & int(GLOBAL_GID_OBJECT_MASK)
+    type_code = (gid >> int(GLOBAL_GID_TYPE_SHIFT)) & int(GLOBAL_GID_TYPE_MASK)
+    scene_id = (gid >> int(GLOBAL_GID_SCENE_SHIFT)) & int(GLOBAL_GID_SCENE_MASK)
+    return {
+        "scene_id": int(scene_id),
+        "type_code": int(type_code),
+        "object_type": object_code_to_type(int(type_code)),
+        "object_id": int(object_id),
+    }
 
 def find_las_path(scene_dir: Path) -> Path | None:
     source_dir = scene_dir / "source"
@@ -1173,7 +1252,7 @@ def _refine_instances_with_ground_and_fence(
         "fence_csf_low_band_ratio": float(fence_csf_low_band_ratio),
     }
     if return_fence_global_ground_mask:
-        return refined_instances, refined_point_instance_id, stats, fence_effective_ground_mask
+        return refined_instances, refined_point_instance_id, stats, fence_global_ground_mask
     return refined_instances, refined_point_instance_id, stats
 
 def assign_points(
@@ -1401,6 +1480,96 @@ def write_scene_las(
     return int(selected.size)
 
 
+def write_compact_final_scene_las(
+    output_path: Path,
+    las_in: laspy.LasData,
+    points_xyz: np.ndarray,
+    *,
+    point_scene_instance_id: np.ndarray,
+    point_pole_group_id: np.ndarray,
+    scene_instance_class_id: np.ndarray,
+    random_seed: int,
+) -> int:
+    num_points = int(points_xyz.shape[0])
+    scene_ids = np.asarray(point_scene_instance_id, dtype=np.int32).reshape(-1)
+    pole_ids = np.asarray(point_pole_group_id, dtype=np.int32).reshape(-1)
+    if scene_ids.shape[0] != num_points or pole_ids.shape[0] != num_points:
+        raise ValueError(
+            "point_scene_instance_id / point_pole_group_id length mismatch with points_xyz"
+        )
+
+    selected_mask = (scene_ids >= 0) | (pole_ids >= 0)
+    selected = np.where(selected_mask)[0].astype(np.int32, copy=False)
+
+    header = laspy.LasHeader(point_format=3, version="1.2")
+    header.scales = np.array(las_in.header.scales, copy=True)
+    header.offsets = np.array(las_in.header.offsets, copy=True)
+    las_out = laspy.LasData(header)
+
+    extra_bytes_params = getattr(laspy, "ExtraBytesParams", None)
+    add_extra_dim = getattr(las_out, "add_extra_dim", None)
+    if extra_bytes_params is not None and callable(add_extra_dim):
+        las_out.add_extra_dim(extra_bytes_params(name="cls_id", type=np.uint8))
+        las_out.add_extra_dim(extra_bytes_params(name="point_scene_instance_id", type=np.int32))
+        las_out.add_extra_dim(extra_bytes_params(name="point_pole_group_id", type=np.int32))
+
+    if selected.size == 0:
+        las_out.write(output_path)
+        return 0
+
+    xyz = points_xyz[selected]
+    las_out.x = xyz[:, 0]
+    las_out.y = xyz[:, 1]
+    las_out.z = xyz[:, 2]
+
+    selected_scene = scene_ids[selected]
+    selected_pole = pole_ids[selected]
+
+    selected_cls = np.zeros((selected.size,), dtype=np.uint8)
+    scene_valid = selected_scene >= 0
+    pole_valid = selected_pole >= 0
+
+    if np.any(scene_valid):
+        scene_cls_arr = np.asarray(scene_instance_class_id, dtype=np.int32).reshape(-1)
+        valid_scene_indices = selected_scene[scene_valid]
+        if valid_scene_indices.size > 0:
+            if int(valid_scene_indices.max()) >= scene_cls_arr.shape[0]:
+                raise ValueError(
+                    "scene_instance_class_id length is insufficient for point_scene_instance_id values"
+                )
+            selected_cls[scene_valid] = scene_cls_arr[valid_scene_indices].astype(np.uint8, copy=False)
+
+    # pole_group points are normalized to cls=1 in compact final LAS.
+    selected_cls[pole_valid] = np.uint8(1)
+    las_out.classification = selected_cls
+
+    scene_color_table = _instance_colors(
+        int(max(1, (int(selected_scene[scene_valid].max()) + 1) if np.any(scene_valid) else 1)),
+        seed=int(random_seed),
+    )
+    pole_color_table = _instance_colors(
+        int(max(1, (int(selected_pole[pole_valid].max()) + 1) if np.any(pole_valid) else 1)),
+        seed=int(random_seed) + 7919,
+    )
+    rgb8 = np.zeros((selected.size, 3), dtype=np.uint8)
+    if np.any(scene_valid):
+        rgb8[scene_valid] = scene_color_table[selected_scene[scene_valid]]
+    if np.any(pole_valid):
+        rgb8[pole_valid] = pole_color_table[selected_pole[pole_valid]]
+    rgb16 = rgb8.astype(np.uint16) * 256
+    las_out.red = rgb16[:, 0]
+    las_out.green = rgb16[:, 1]
+    las_out.blue = rgb16[:, 2]
+
+    if extra_bytes_params is not None and callable(add_extra_dim):
+        las_out.cls_id = selected_cls
+        las_out.point_scene_instance_id = selected_scene.astype(np.int32, copy=False)
+        las_out.point_pole_group_id = selected_pole.astype(np.int32, copy=False)
+
+    las_out.write(output_path)
+    return int(selected.size)
+
+
 def write_point_subset_las(
     output_path: Path,
     las_in: laspy.LasData,
@@ -1452,9 +1621,10 @@ def build_pole_groups(
     *,
     eps: float = 0.3,
     min_samples: int = 10,
+    min_cluster_points: int = 0,
 ) -> tuple[list[dict[str, Any]], np.ndarray]:
     """
-    Build merged pole groups from point-level clustering of class 1..6 points.
+    Build merged pole groups from point-level 3D clustering of class 1..6 points.
 
     Returns:
       pole_groups: list of dicts with merged metadata
@@ -1495,13 +1665,16 @@ def build_pole_groups(
         points_xyz,
         pole_points,
         eps=float(eps),
-        use_xy_only=True,
+        use_xy_only=False,
         min_samples=max(1, int(min_samples)),
     )
+    min_cluster_points = max(0, int(min_cluster_points))
 
     pole_groups: list[dict[str, Any]] = []
     for cluster in clusters:
         cluster_points = np.unique(np.asarray(cluster, dtype=np.int32).reshape(-1))
+        if min_cluster_points > 0 and int(cluster_points.size) < min_cluster_points:
+            continue
         if cluster_points.size == 0:
             continue
         valid = (cluster_points >= 0) & (cluster_points < num_points)
@@ -1704,6 +1877,10 @@ def save_scene_npz(
     pole_group_candidate_class_names = np.empty((pole_group_count,), dtype=object)
     pole_group_member_instance_ids = np.empty((pole_group_count,), dtype=object)
     pole_group_point_indices = np.empty((pole_group_count,), dtype=object)
+    pole_group_diameter_m = np.full((pole_group_count,), np.nan, dtype=np.float32)
+    pole_group_center_x = np.full((pole_group_count,), np.nan, dtype=np.float32)
+    pole_group_center_y = np.full((pole_group_count,), np.nan, dtype=np.float32)
+    pole_group_metric_source = np.full((pole_group_count,), "", dtype="<U64")
     pole_group_has_flags = {
         cls_id: np.zeros((pole_group_count,), dtype=np.uint8)
         for cls_id in range(1, 7)
@@ -1729,6 +1906,17 @@ def save_scene_npz(
         pole_group_candidate_class_names[idx] = candidate_names
         pole_group_member_instance_ids[idx] = member_ids
         pole_group_point_indices[idx] = points
+
+        diameter_val = float(group.get("diameter_m", np.nan))
+        if np.isfinite(diameter_val):
+            pole_group_diameter_m[idx] = np.float32(diameter_val)
+        center_raw = np.asarray(group.get("center_xy", np.asarray([np.nan, np.nan], dtype=np.float32)), dtype=np.float32).reshape(-1)
+        if center_raw.size >= 2:
+            if np.isfinite(float(center_raw[0])):
+                pole_group_center_x[idx] = np.float32(center_raw[0])
+            if np.isfinite(float(center_raw[1])):
+                pole_group_center_y[idx] = np.float32(center_raw[1])
+        pole_group_metric_source[idx] = str(group.get("metric_source", ""))
         for cls_id in range(1, 7):
             pole_group_has_flags[cls_id][idx] = np.uint8(1 if int(group.get(f"has_cls_{cls_id}", 0)) != 0 else 0)
 
@@ -1758,6 +1946,10 @@ def save_scene_npz(
         pole_group_candidate_class_names=pole_group_candidate_class_names,
         pole_group_member_instance_ids=pole_group_member_instance_ids,
         pole_group_point_indices=pole_group_point_indices,
+        pole_group_diameter_m=pole_group_diameter_m,
+        pole_group_center_x=pole_group_center_x,
+        pole_group_center_y=pole_group_center_y,
+        pole_group_metric_source=pole_group_metric_source,
         point_pole_group_id=point_pole_group_id_arr.astype(np.int32, copy=False),
         pole_group_has_cls_1=pole_group_has_flags[1],
         pole_group_has_cls_2=pole_group_has_flags[2],

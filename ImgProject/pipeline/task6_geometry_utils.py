@@ -6,6 +6,16 @@ from typing import Any
 import numpy as np
 
 try:
+    from scipy.spatial import cKDTree  # type: ignore
+    from scipy.sparse import csr_matrix  # type: ignore
+    from scipy.sparse.csgraph import connected_components, dijkstra  # type: ignore
+except Exception:  # pragma: no cover
+    cKDTree = None
+    csr_matrix = None
+    connected_components = None
+    dijkstra = None
+
+try:
     import CSF  # type: ignore
 except Exception:  # pragma: no cover
     CSF = None
@@ -79,8 +89,10 @@ def estimate_ground_z(
     points_xyz: np.ndarray,
     point_indices: np.ndarray | list[int],
     *,
+    ground_points_xyz: np.ndarray | None = None,
     global_ground_mask: np.ndarray | None = None,
     neighborhood_radius: float = 2.0,
+    neighborhood_quantile: float = 0.10,
 ) -> tuple[float, str]:
     idx = _as_valid_point_indices(point_indices, num_points=points_xyz.shape[0])
     if idx.size == 0:
@@ -88,6 +100,17 @@ def estimate_ground_z(
 
     object_xyz = points_xyz[idx]
     object_xy_center = object_xyz[:, :2].mean(axis=0)
+    q = min(1.0, max(0.0, float(neighborhood_quantile)))
+
+    if isinstance(ground_points_xyz, np.ndarray):
+        gxyz = np.asarray(ground_points_xyz, dtype=np.float32).reshape(-1, 3)
+        if gxyz.shape[0] > 0:
+            gxy = gxyz[:, :2]
+            dist2 = np.sum((gxy - object_xy_center[None, :]) ** 2, axis=1)
+            near = dist2 <= float(neighborhood_radius) ** 2
+            if int(np.count_nonzero(near)) >= 5:
+                z = gxyz[near, 2]
+                return float(np.quantile(z, q)), f"task5_csf_ground_neighborhood_q{int(round(q * 100))}"
 
     if isinstance(global_ground_mask, np.ndarray) and global_ground_mask.shape[0] == points_xyz.shape[0]:
         xy = points_xyz[:, :2]
@@ -96,7 +119,7 @@ def estimate_ground_z(
         near_ground = near & global_ground_mask
         if int(np.count_nonzero(near_ground)) >= 5:
             z = points_xyz[near_ground, 2]
-            return float(np.median(z)), "csf_neighborhood"
+            return float(np.quantile(z, q)), f"csf_neighborhood_q{int(round(q * 100))}"
 
     object_z = object_xyz[:, 2]
     return float(np.quantile(object_z, 0.02)), "q02_fallback"
@@ -190,6 +213,241 @@ def estimate_centroid_xy(points_xyz: np.ndarray, point_indices: np.ndarray | lis
     return [_round_float(center[0]), _round_float(center[1])]
 
 
+def estimate_mid_band_centroid_xy(
+    points_xyz: np.ndarray,
+    point_indices: np.ndarray | list[int],
+    *,
+    low_ratio: float = 0.30,
+    high_ratio: float = 0.70,
+) -> tuple[list[float] | None, str]:
+    idx = _as_valid_point_indices(point_indices, num_points=points_xyz.shape[0])
+    if idx.size == 0:
+        return None, "empty"
+
+    z = points_xyz[idx, 2]
+    q05 = float(np.quantile(z, 0.05))
+    q95 = float(np.quantile(z, 0.95))
+    span = max(1e-6, q95 - q05)
+    low = q05 + min(float(low_ratio), float(high_ratio)) * span
+    high = q05 + max(float(low_ratio), float(high_ratio)) * span
+    mid_mask = (z >= low) & (z <= high)
+    mid_idx = idx[mid_mask]
+
+    min_mid_points = max(8, min(80, int(idx.size * 0.1)))
+    if mid_idx.size < min_mid_points:
+        center = points_xyz[idx, :2].mean(axis=0)
+        return [_round_float(center[0]), _round_float(center[1])], "full_centroid_fallback"
+
+    center = points_xyz[mid_idx, :2].mean(axis=0)
+    return [_round_float(center[0]), _round_float(center[1])], "mid_band_centroid"
+
+
+def _downsample_xy_by_grid(
+    xy: np.ndarray,
+    *,
+    grid_size: float = 0.10,
+    max_points: int = 4000,
+) -> np.ndarray:
+    coords = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    if coords.shape[0] <= 1:
+        return coords.astype(np.float32, copy=False)
+    if grid_size <= 1e-6:
+        out = np.unique(coords, axis=0)
+    else:
+        mins = coords.min(axis=0, keepdims=True)
+        grid = np.floor((coords - mins) / float(grid_size)).astype(np.int64)
+        uniq, inv = np.unique(grid, axis=0, return_inverse=True)
+        sums = np.zeros((uniq.shape[0], 2), dtype=np.float64)
+        cnt = np.zeros((uniq.shape[0],), dtype=np.int64)
+        np.add.at(sums, inv, coords)
+        np.add.at(cnt, inv, 1)
+        out = sums / np.maximum(cnt[:, None], 1)
+    if out.shape[0] > int(max_points):
+        keep = np.linspace(0, out.shape[0] - 1, num=int(max_points), dtype=np.int64)
+        out = out[keep]
+    return out.astype(np.float32, copy=False)
+
+
+def _sample_polyline_by_count(polyline_xy: np.ndarray, count: int) -> np.ndarray:
+    pts = np.asarray(polyline_xy, dtype=np.float64).reshape(-1, 2)
+    n = int(max(2, count))
+    if pts.shape[0] == 0:
+        return np.zeros((n, 2), dtype=np.float32)
+    if pts.shape[0] == 1:
+        return np.repeat(pts.astype(np.float32, copy=False), n, axis=0)
+
+    seg = pts[1:] - pts[:-1]
+    seg_len = np.linalg.norm(seg, axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total = float(cum[-1])
+    if total <= 1e-9:
+        return np.repeat(pts[:1].astype(np.float32, copy=False), n, axis=0)
+
+    targets = np.linspace(0.0, total, num=n, dtype=np.float64)
+    out = np.zeros((n, 2), dtype=np.float64)
+    j = 0
+    for i, t in enumerate(targets):
+        while j < seg_len.shape[0] - 1 and cum[j + 1] < t:
+            j += 1
+        start = pts[j]
+        end = pts[j + 1]
+        den = max(cum[j + 1] - cum[j], 1e-12)
+        alpha = float((t - cum[j]) / den)
+        alpha = min(1.0, max(0.0, alpha))
+        out[i] = start * (1.0 - alpha) + end * alpha
+    return out.astype(np.float32, copy=False)
+
+
+def _build_pca_centerline(xy: np.ndarray, point_count: int) -> np.ndarray:
+    coords = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    if coords.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    if coords.shape[0] == 1:
+        return np.repeat(coords.astype(np.float32, copy=False), int(max(2, point_count)), axis=0)
+
+    centered = coords - coords.mean(axis=0, keepdims=True)
+    try:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        axis = np.asarray([1.0, 0.0], dtype=np.float64)
+    else:
+        axis = vh[0] if vh.shape[0] >= 1 else np.asarray([1.0, 0.0], dtype=np.float64)
+    proj = centered @ axis
+    t_min = float(np.min(proj))
+    t_max = float(np.max(proj))
+    t = np.linspace(t_min, t_max, num=int(max(2, point_count)), dtype=np.float64)
+    line = coords.mean(axis=0, keepdims=True) + t[:, None] * axis[None, :]
+    return line.astype(np.float32, copy=False)
+
+
+def _longest_path_xy_from_knn_graph(
+    xy: np.ndarray,
+    *,
+    knn: int = 8,
+) -> np.ndarray | None:
+    coords = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    n = int(coords.shape[0])
+    if n < 2:
+        return None
+    if (
+        cKDTree is None
+        or csr_matrix is None
+        or connected_components is None
+        or dijkstra is None
+    ):
+        return None
+
+    k = int(max(2, min(knn + 1, n)))
+    tree = cKDTree(coords)
+    dists, nbrs = tree.query(coords, k=k)
+    if k == 1:
+        return None
+    dists = np.asarray(dists, dtype=np.float64).reshape(n, k)
+    nbrs = np.asarray(nbrs, dtype=np.int64).reshape(n, k)
+
+    rows: list[int] = []
+    cols: list[int] = []
+    vals: list[float] = []
+    for i in range(n):
+        for j in range(1, k):
+            nb = int(nbrs[i, j])
+            dist = float(dists[i, j])
+            if nb < 0 or nb >= n or nb == i:
+                continue
+            if not np.isfinite(dist) or dist <= 0.0:
+                continue
+            rows.extend([i, nb])
+            cols.extend([nb, i])
+            vals.extend([dist, dist])
+    if not rows:
+        return None
+
+    graph = csr_matrix((np.asarray(vals), (np.asarray(rows), np.asarray(cols))), shape=(n, n))
+    comp_n, comp_labels = connected_components(csgraph=graph, directed=False, return_labels=True)
+    if int(comp_n) <= 0:
+        return None
+    comp_sizes = np.bincount(comp_labels.astype(np.int64), minlength=int(comp_n))
+    keep_comp = int(np.argmax(comp_sizes))
+    keep_nodes = np.where(comp_labels == keep_comp)[0]
+    if keep_nodes.size < 2:
+        return None
+
+    sub = graph[keep_nodes][:, keep_nodes]
+    sub_xy = coords[keep_nodes]
+    seed = int(np.argmin(np.sum(sub_xy, axis=1)))
+    dist_seed = dijkstra(csgraph=sub, directed=False, indices=seed)
+    if not np.any(np.isfinite(dist_seed)):
+        return None
+    a = int(np.nanargmax(np.where(np.isfinite(dist_seed), dist_seed, -1.0)))
+    dist_a, pred = dijkstra(csgraph=sub, directed=False, indices=a, return_predecessors=True)
+    if not np.any(np.isfinite(dist_a)):
+        return None
+    b = int(np.nanargmax(np.where(np.isfinite(dist_a), dist_a, -1.0)))
+
+    path_sub: list[int] = []
+    cur = b
+    guard = 0
+    while cur != -9999 and cur >= 0 and guard <= int(sub.shape[0] + 5):
+        path_sub.append(int(cur))
+        if cur == a:
+            break
+        cur = int(pred[cur])
+        guard += 1
+    if len(path_sub) < 2:
+        return None
+    path_sub = path_sub[::-1]
+    return sub_xy[np.asarray(path_sub, dtype=np.int64)].astype(np.float32, copy=False)
+
+
+def estimate_fence_control_points_xy(
+    points_xyz: np.ndarray,
+    point_indices: np.ndarray | list[int],
+    *,
+    mid_band_low_ratio: float = 0.30,
+    mid_band_high_ratio: float = 0.70,
+    control_point_count: int = 5,
+    grid_size: float = 0.10,
+    knn: int = 8,
+) -> tuple[list[list[float]] | None, str]:
+    idx = _as_valid_point_indices(point_indices, num_points=points_xyz.shape[0])
+    if idx.size == 0:
+        return None, "empty"
+
+    z = points_xyz[idx, 2]
+    q05 = float(np.quantile(z, 0.05))
+    q95 = float(np.quantile(z, 0.95))
+    span = max(1e-6, q95 - q05)
+    low = q05 + min(float(mid_band_low_ratio), float(mid_band_high_ratio)) * span
+    high = q05 + max(float(mid_band_low_ratio), float(mid_band_high_ratio)) * span
+    mid_mask = (z >= low) & (z <= high)
+    mid_idx = idx[mid_mask]
+    if mid_idx.size < max(20, int(idx.size * 0.1)):
+        mid_idx = idx
+        method_prefix = "full_band"
+    else:
+        method_prefix = "mid_band"
+
+    xy = points_xyz[mid_idx, :2]
+    if xy.shape[0] < 2:
+        center = points_xyz[idx, :2].mean(axis=0)
+        cp = [[_round_float(center[0]), _round_float(center[1])] for _ in range(int(max(2, control_point_count)))]
+        return cp, f"{method_prefix}_centroid_repeat"
+
+    xy_ds = _downsample_xy_by_grid(xy, grid_size=float(grid_size))
+    line = _longest_path_xy_from_knn_graph(xy_ds, knn=int(knn))
+    if line is None or line.shape[0] < 2:
+        line = _build_pca_centerline(xy_ds, point_count=max(2, int(control_point_count)))
+        method = f"{method_prefix}_pca_fallback"
+    else:
+        method = f"{method_prefix}_knn_longest_path"
+
+    sampled = _sample_polyline_by_count(line, int(max(2, control_point_count)))
+    out: list[list[float]] = []
+    for p in sampled:
+        out.append([_round_float(p[0]), _round_float(p[1])])
+    return out, method
+
+
 def estimate_xy_box_size(points_xyz: np.ndarray, point_indices: np.ndarray | list[int]) -> tuple[float | None, float | None]:
     idx = _as_valid_point_indices(point_indices, num_points=points_xyz.shape[0])
     if idx.size < 3:
@@ -237,29 +495,43 @@ def geometry_for_pole_group(
     point_indices: np.ndarray | list[int],
     *,
     candidate_class_ids: list[int] | np.ndarray,
+    ground_points_xyz: np.ndarray | None = None,
     global_ground_mask: np.ndarray | None = None,
+    neighborhood_radius: float = 2.0,
+    neighborhood_quantile: float = 0.10,
+    precomputed_diameter_m: float | None = None,
+    precomputed_center_xy: np.ndarray | list[float] | tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     class_ids = {int(x) for x in np.asarray(candidate_class_ids, dtype=np.int32).reshape(-1)}
     ground_z, ground_method = estimate_ground_z(
         points_xyz,
         point_indices,
+        ground_points_xyz=ground_points_xyz,
         global_ground_mask=global_ground_mask,
+        neighborhood_radius=float(neighborhood_radius),
+        neighborhood_quantile=float(neighborhood_quantile),
     )
     height_m = compute_height_m(points_xyz, point_indices, ground_z=ground_z)
     out: dict[str, Any] = {
         "height_m": _round_float(height_m),
         "ground_z_method": ground_method,
     }
-    if 1 in class_ids or 2 in class_ids:
-        diameter_m, center_xy = estimate_diameter_and_center_xy(
-            points_xyz,
-            point_indices,
-            ground_z=ground_z,
-        )
-        out["diameter_m"] = _round_float(diameter_m)
-        out["center_xy"] = center_xy
-    else:
-        out["centroid_xy"] = estimate_centroid_xy(points_xyz, point_indices)
+    diameter_out = _round_float(precomputed_diameter_m)
+    center_out: list[float] | None = None
+    if precomputed_center_xy is not None:
+        center_arr = np.asarray(precomputed_center_xy, dtype=np.float32).reshape(-1)
+        if center_arr.size >= 2 and np.isfinite(float(center_arr[0])) and np.isfinite(float(center_arr[1])):
+            center_out = [_round_float(center_arr[0]), _round_float(center_arr[1])]
+
+    # Keep diameter empty when Task5 has no reliable precomputed metric.
+    # Do not fallback to re-estimation in Task6.
+    if center_out is None:
+        center_out = estimate_centroid_xy(points_xyz, point_indices)
+
+    out["diameter_m"] = diameter_out
+    out["center_xy"] = center_out
+    if class_ids:
+        out["candidate_class_ids"] = sorted(class_ids)
     return out
 
 
@@ -269,29 +541,41 @@ def geometry_for_scene_instance(
     *,
     class_id: int,
     tree_metric: dict[str, Any] | None = None,
+    ground_points_xyz: np.ndarray | None = None,
     global_ground_mask: np.ndarray | None = None,
+    neighborhood_radius: float = 2.0,
+    neighborhood_quantile: float = 0.10,
+    mid_centroid_low_ratio: float = 0.30,
+    mid_centroid_high_ratio: float = 0.70,
+    fence_mid_band_low_ratio: float = 0.30,
+    fence_mid_band_high_ratio: float = 0.70,
+    fence_control_point_count: int = 5,
+    fence_grid_size: float = 0.10,
+    fence_knn: int = 8,
 ) -> dict[str, Any]:
     cls_id = int(class_id)
     ground_z, ground_method = estimate_ground_z(
         points_xyz,
         point_indices,
+        ground_points_xyz=ground_points_xyz,
         global_ground_mask=global_ground_mask,
+        neighborhood_radius=float(neighborhood_radius),
+        neighborhood_quantile=float(neighborhood_quantile),
     )
     height_m = compute_height_m(points_xyz, point_indices, ground_z=ground_z)
 
-    if cls_id in {3, 4, 5, 6}:
+    if cls_id in {8, 9, 10, 12, 13, 14}:
+        center_xy, center_method = estimate_mid_band_centroid_xy(
+            points_xyz,
+            point_indices,
+            low_ratio=float(mid_centroid_low_ratio),
+            high_ratio=float(mid_centroid_high_ratio),
+        )
         return {
-            "centroid_xy": estimate_centroid_xy(points_xyz, point_indices),
+            "center_xy": center_xy,
             "height_m": _round_float(height_m),
             "ground_z_method": ground_method,
-        }
-    if cls_id in {8, 10}:
-        length_m, width_m = estimate_xy_box_size(points_xyz, point_indices)
-        return {
-            "length_m": _round_float(length_m),
-            "width_m": _round_float(width_m),
-            "height_m": _round_float(height_m),
-            "ground_z_method": ground_method,
+            "center_xy_method": center_method,
         }
     if cls_id == 7:
         dbh_m = None
@@ -305,19 +589,24 @@ def geometry_for_scene_instance(
             "height_m": _round_float(height_m),
             "ground_z_method": ground_method,
         }
-    if cls_id in {1, 2}:
-        diameter_m, center_xy = estimate_diameter_and_center_xy(
+    if cls_id == 15:
+        control_points_xy, centerline_method = estimate_fence_control_points_xy(
             points_xyz,
             point_indices,
-            ground_z=ground_z,
+            mid_band_low_ratio=float(fence_mid_band_low_ratio),
+            mid_band_high_ratio=float(fence_mid_band_high_ratio),
+            control_point_count=int(max(2, fence_control_point_count)),
+            grid_size=float(fence_grid_size),
+            knn=int(max(2, fence_knn)),
         )
         return {
-            "diameter_m": _round_float(diameter_m),
-            "center_xy": center_xy,
+            "control_points_xy": control_points_xy,
             "height_m": _round_float(height_m),
             "ground_z_method": ground_method,
+            "centerline_method": centerline_method,
         }
     return {
+        "center_xy": estimate_centroid_xy(points_xyz, point_indices),
         "height_m": _round_float(height_m),
         "ground_z_method": ground_method,
     }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,12 @@ def parse_json_response(text: str) -> dict[str, Any]:
 
 
 def load_glm_model_and_processor(model_path: str) -> tuple[Any, Any]:
+    if find_spec("accelerate") is None:
+        raise RuntimeError(
+            "Task6 GLM loading uses device_map='auto', which requires accelerate. "
+            "Install it in the current environment with: pip install 'accelerate>=1.13.0'"
+        )
+
     from transformers import AutoProcessor, Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration
 
     processor = AutoProcessor.from_pretrained(model_path)
