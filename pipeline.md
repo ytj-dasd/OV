@@ -348,7 +348,14 @@ python ImgProject/pipeline/task5_merge_scene_las_by_suffix.py \
    - `both`：语义 VLM + 几何属性都执行（默认）
    - `geometry`：仅计算几何属性，不调用 VLM
    - `vlm`：仅调用 VLM，几何属性留空
-3. `--disable-glm` 仍可用；若与 `--run-stage vlm` 同时使用，将不会执行语义推理。
+3. VLM 后端选择：`--vlm-backend glm|qwen|gemma`，默认 `glm`。
+4. 默认模型：`glm` 使用 `ZhipuAI/GLM-4.6V-Flash`；`qwen` 使用 `Qwen/Qwen3-VL-8B-Instruct`；`gemma` 使用 `google/gemma-4-E4B-it`。
+5. `--model-path` 可覆盖默认模型路径。
+6. 采样参数默认按后端自动切换（命令行显式传入会覆盖）：
+   - `glm`: `temperature=0.2`, `repetition_penalty=1.1`, `top_p=0.8`, `top_k=2`
+   - `qwen`: `temperature=0.2`, `repetition_penalty=1.1`, `top_p=0.8`, `top_k=2`
+   - `gemma`: `temperature=1.0`, `repetition_penalty=1.0`, `top_p=0.95`, `top_k=64`
+7. `--disable-vlm` 可跳过语义推理；旧参数 `--disable-glm` 仍兼容。
 
 #### 任务6A：BEV 全局分支
 处理：
@@ -371,23 +378,20 @@ python ImgProject/pipeline/task5_merge_scene_las_by_suffix.py \
 2. 视角：每个目标只生成 2 张图：`0°(front)` 与 `+90°(side)`。
 3. `0°` 方向定义为“最近有效站点到目标质心的水平向量”；`+90°` 为绕 `Z` 轴旋转 90°。
 4. 成图策略：从源 LAS 提取实例点（含 RGB）后，使用 Task2 同源 `pc2img_soft` 进行实例级重投影。
-5. 相机参数：固定 `FOV=90°`。`front` 视角通过迭代调整相机距离，使占比接近 `0.8`；`side` 视角直接复用 `front` 距离，不再单独做占比迭代。
+5. 相机参数：固定 `FOV=90°`。`front` 视角通过迭代调整相机距离，优先保证目标完整投影在画布内（上下两端不能被截断），再尽量让完整投影范围接近占比 `0.8`；`side` 视角以 `front` 距离为初值，仅在完整投影仍出画时向外放大距离，不再单独追求占比 `0.8`。
 6. `side` 兜底：若 `+90°` 失败，尝试 `-90°`；若仍失败，记录 `front-only` 状态并继续输出该对象属性，不因 side 失败丢记录。
-7. 自适应裁剪：目标占图比例固定 `0.8`。
+7. 自适应裁剪：裁剪 bbox 使用全体实例点的几何投影范围，而不是渲染命中的像素范围；目标完整进入画布后，裁剪占图比例固定 `0.8`。
    - `crop_w = bbox_w / 0.8`
    - `crop_h = bbox_h / 0.8`
 8. 允许黑边补齐；若裁剪后长边大于 `1024`，按比例下采样到 `1024`。
-9. Front 渲染图默认保留原图，并额外输出标注图 `*_annotated.png`：
-   - 杆状物（`pole_group`）前/侧两张图都叠加 `semantic_attributes_json`。
-   - 树木（`scene_instance class_id=7`）前/侧两张图都叠加 `semantic_attributes_json`。
-   - 标注图路径写入 `evidence_json.front_annotated_image / side_annotated_image`。
+9. Front 渲染图只保留原始渲染图，不叠加 `semantic_attributes_json`，也不额外输出 `*_annotated.png`。
 
 语义属性范围（只保留你明确需要的键）：
 1. 杆状物组：
    - `contains_classes`
    - 若包含路灯杆：`arm_type`, `light_count`
    - 若包含路牌/交通标志：`sign_shape`, `sign_color`, `sign_content`
-2. 树木：`tree_type`, `tree_trunk_visible`, `tree_pit`
+2. 树木：`tree_type`, `tree_trunk_visible`
 
 几何属性范围：
 1. 杆状物 6 类（电线杆、路灯杆、路牌、交通标志、红绿灯、监控）：`center_xy`, `diameter_m`, `height_m`
@@ -461,9 +465,10 @@ Picture 1 是井盖局部俯视图，Picture 2 是井盖所在区域全局俯视
 杆状物组（Front，front+side）：
 ```text
 Picture 1 是同一杆状物的 front 视图，Picture 2 是 side90 视图。
-候选类别仅限：[电线杆, 路灯杆, 路牌, 交通标志, 红绿灯, 监控]。
+候选类别参考（非限制）：[电线杆, 路灯杆, 路牌, 交通标志, 红绿灯, 监控]。
+最终 contains_classes 允许从以下 6 类中多选：[电线杆, 路灯杆, 路牌, 交通标志, 红绿灯, 监控]，不要受候选类别限制。
 请输出包含的类别（可多选），并按命中类别补充属性：
-- 路灯杆: arm_type, light_count
+- 路灯杆: arm_type, light_count；若包含路灯杆，arm_type 只能输出 single_arm、double_arm、no_arm 中的一个（single_arm=单臂，double_arm=双臂，no_arm=无臂）
 - 路牌/交通标志: sign_shape, sign_color, sign_content
 只输出 JSON：
 {
@@ -480,9 +485,9 @@ Picture 1 是同一杆状物的 front 视图，Picture 2 是 side90 视图。
 树木（Front，front+side）：
 ```text
 Picture 1 是树木 front 视图，Picture 2 是 side90 视图。
-请判断 tree_type、tree_trunk_visible、tree_pit。
+请判断 tree_type、tree_trunk_visible。
 只输出 JSON：
-{"tree_type":"...","tree_trunk_visible":"是/否","tree_pit":"是/否","confidence":0.0}
+{"tree_type":"...","tree_trunk_visible":"是/否","confidence":0.0}
 ```
 
 示例：
@@ -493,5 +498,30 @@ python ImgProject/pipeline/task6_scene_attribute_extract.py \
   --run-stage geometry \
   --task5-output-dir fusion \
   --bev-dir benchmark/bev \
-  --model-path ZhipuAI/GLM-4.6V-Flash
+  --vlm-backend glm \
+  --model-path GLM-V/ZhipuAI/GLM-4.6V-Flash
+```
+
+Qwen 语义推理示例：
+```bash
+python ImgProject/pipeline/task6_scene_attribute_extract.py \
+  --data-root benchmark \
+  --run-branch front \
+  --run-stage both \
+  --task5-output-dir fusion \
+  --bev-dir benchmark/bev \
+  --vlm-backend qwen \
+  --model-path Qwen3-VL/Qwen/Qwen3-VL-8B-Instruct
+```
+
+Gemma 语义推理示例：
+```bash
+python ImgProject/pipeline/task6_scene_attribute_extract.py \
+  --data-root benchmark \
+  --run-branch front \
+  --run-stage both \
+  --task5-output-dir fusion \
+  --bev-dir benchmark/bev \
+  --vlm-backend gemma \
+  --model-path gemma4/gemma-4-E4B-it
 ```

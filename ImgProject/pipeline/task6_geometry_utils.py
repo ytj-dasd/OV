@@ -4,6 +4,10 @@ import math
 from typing import Any
 
 import numpy as np
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None
 
 try:
     from scipy.spatial import cKDTree  # type: ignore
@@ -177,6 +181,32 @@ def _fit_circle_taubin_svd_xy(points_xy: np.ndarray) -> tuple[np.ndarray, float]
     if not np.isfinite(radius):
         return None
     return center.astype(np.float32, copy=False), radius
+
+
+def _fit_min_enclosing_circle_xy(points_xy: np.ndarray) -> tuple[np.ndarray, float] | None:
+    xy = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    if xy.shape[0] < 1:
+        return None
+
+    if cv2 is not None:
+        try:
+            center_xy, radius = cv2.minEnclosingCircle(xy)
+            center = np.asarray(center_xy, dtype=np.float32)
+            radius_f = float(radius)
+        except Exception:
+            return None
+        if center.size < 2 or (not np.isfinite(radius_f)):
+            return None
+        return center, radius_f
+
+    center = xy.mean(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    dist = np.sqrt(np.sum((xy.astype(np.float64) - center.astype(np.float64)) ** 2, axis=1))
+    if dist.size == 0:
+        return None
+    radius = float(np.max(dist))
+    if not np.isfinite(radius):
+        return None
+    return center, radius
 
 
 def estimate_diameter_and_center_xy(
@@ -475,18 +505,35 @@ def compute_manhole_geometry_from_pixels(
     pixel_xy: np.ndarray,
     *,
     resolution_m_per_px: float = 0.02,
+    global_origin_min_x: float | None = None,
+    global_origin_max_y: float | None = None,
 ) -> dict[str, Any]:
     coords = np.asarray(pixel_xy, dtype=np.float32).reshape(-1, 2)
+    empty = {"circle_center_global_xy": None, "circle_radius_m": None, "circle_center_px": None}
     if coords.shape[0] < 3:
-        return {"circle_center_xy": None, "circle_radius_m": None}
-    coords_m = coords * float(resolution_m_per_px)
-    fit = _fit_circle_taubin_svd_xy(coords_m)
+        return empty
+
+    fit = _fit_min_enclosing_circle_xy(coords)
     if fit is None:
-        return {"circle_center_xy": None, "circle_radius_m": None}
-    center, radius = fit
+        return empty
+
+    resolution = float(resolution_m_per_px)
+    if (not np.isfinite(resolution)) or resolution <= 1e-12:
+        return empty
+
+    center_px, radius_px = fit
+    radius_m = float(radius_px) * resolution
+    center_global_xy: list[float] | None = None
+    if global_origin_min_x is not None and global_origin_max_y is not None:
+        gx = float(global_origin_min_x) + float(center_px[0]) * resolution
+        gy = float(global_origin_max_y) - float(center_px[1]) * resolution
+        if np.isfinite(gx) and np.isfinite(gy):
+            center_global_xy = [_round_float(gx), _round_float(gy)]
+
     return {
-        "circle_center_xy": [_round_float(center[0]), _round_float(center[1])],
-        "circle_radius_m": _round_float(radius),
+        "circle_center_global_xy": center_global_xy,
+        "circle_radius_m": _round_float(radius_m),
+        "circle_center_px": [_round_float(center_px[0]), _round_float(center_px[1])],
     }
 
 

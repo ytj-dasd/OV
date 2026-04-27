@@ -4,10 +4,10 @@ import argparse
 import json
 import math
 import sys
-import textwrap
 from pathlib import Path
 from typing import Any
 
+import cv2
 import laspy
 import numpy as np
 from PIL import Image, ImageDraw
@@ -28,16 +28,37 @@ from task6_geometry_utils import (
     geometry_for_scene_instance,
 )
 from task6_glm_utils import (
-    DEFAULT_MODEL_PATH,
     MANHOLE_PROMPT,
     TREE_PROMPT,
     build_pole_group_prompt,
-    load_glm_model_and_processor,
-    run_dual_image_glm,
+    load_vlm_model_and_processor,
+    resolve_vlm_model_path,
+    run_dual_image_vlm,
 )
 
 
 SUPPORTED_SCENE_INSTANCE_CLASSES = frozenset({7, 8, 9, 10, 12, 13, 14, 15})
+GLM_VLM_SAMPLING_DEFAULTS: dict[str, float | int] = {
+    "max_new_tokens": 512,
+    "temperature": 0.2,
+    "repetition_penalty": 1.1,
+    "top_p": 0.8,
+    "top_k": 2,
+}
+QWEN_VLM_SAMPLING_DEFAULTS: dict[str, float | int] = {
+    "max_new_tokens": 512,
+    "temperature": 0.2,
+    "repetition_penalty": 1.1,
+    "top_p": 0.8,
+    "top_k": 2,
+}
+GEMMA_VLM_SAMPLING_DEFAULTS: dict[str, float | int] = {
+    "max_new_tokens": 512,
+    "temperature": 1.0,
+    "repetition_penalty": 1.0,
+    "top_p": 0.95,
+    "top_k": 64,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,7 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--front-buffer-size", type=float, default=0.05, help="Buffer size passed to soft-splat renderer.")
     parser.add_argument("--front-distance-min", type=float, default=1.0, help="Minimum camera distance for front-view rendering.")
     parser.add_argument("--front-distance-max", type=float, default=120.0, help="Maximum camera distance for front-view rendering.")
-    parser.add_argument("--front-distance-iters", type=int, default=6, help="Iterations used to solve camera distance for target fill ratio.")
+    parser.add_argument("--front-distance-iters", type=int, default=6, help="Iterations used to solve camera distance with full-in-frame constraint.")
+    parser.add_argument("--front-crop-pad-px", type=int, default=4, help="Pixel padding added on each side of the projected-object crop box.")
     parser.add_argument("--max-image-side", type=int, default=1024, help="If output crop max side exceeds this value, downsample proportionally.")
     parser.add_argument("--mid-centroid-low-ratio", type=float, default=0.30, help="Lower ratio (within q05-q95 span) used to compute mid-band centroid for center_xy classes.")
     parser.add_argument("--mid-centroid-high-ratio", type=float, default=0.70, help="Upper ratio (within q05-q95 span) used to compute mid-band centroid for center_xy classes.")
@@ -79,17 +101,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fence-centerline-knn", type=int, default=8, help="KNN used for fence centerline graph construction.")
     parser.add_argument("--ground-neighborhood-radius", type=float, default=2.0, help="XY neighborhood radius (meters) used for local ground-z estimation.")
     parser.add_argument("--ground-neighborhood-quantile", type=float, default=0.10, help="Quantile of neighborhood ground z used as ground_z (default q10).")
-    parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH, help="GLM model path.")
-    parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--repetition-penalty", type=float, default=1.1)
-    parser.add_argument("--top-p", type=float, default=0.8)
-    parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument(
+        "--vlm-backend",
+        type=lambda s: str(s).strip().lower(),
+        choices=("glm", "qwen", "gemma"),
+        default="glm",
+        help="VLM backend used for semantic inference.",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="VLM model path. If omitted, defaults to GLM-4.6V-Flash (glm), Qwen3-VL-8B-Instruct (qwen), and gemma-4-E4B-it (gemma).",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Sampling max_new_tokens. Backend defaults: glm=512, qwen=512, gemma=512.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature. Backend defaults: glm=0.2, qwen=0.2, gemma=1.0.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Sampling repetition penalty. Backend defaults: glm=1.1, qwen=1.1, gemma=1.0.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Sampling top_p. Backend defaults: glm=0.8, qwen=0.8, gemma=0.95.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Sampling top_k. Backend defaults: glm=2, qwen=2, gemma=64.",
+    )
     parser.add_argument(
         "--disable-glm",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Disable GLM semantic inference and keep semantic attributes empty/default.",
+        help="Disable VLM semantic inference and keep semantic attributes empty/default. Kept for backward compatibility.",
+    )
+    parser.add_argument(
+        "--disable-vlm",
+        action=argparse.BooleanOptionalAction,
+        dest="disable_glm",
+        default=argparse.SUPPRESS,
+        help="Disable VLM semantic inference and keep semantic attributes empty/default.",
     )
     parser.add_argument(
         "--overwrite",
@@ -108,8 +174,83 @@ def _normalize_run_branch(run_branch: str) -> str:
     return "both"
 
 
+def _resolve_vlm_sampling_args(args: argparse.Namespace, *, vlm_backend: str) -> dict[str, float | int]:
+    backend = str(vlm_backend).strip().lower()
+    if backend == "qwen":
+        defaults = QWEN_VLM_SAMPLING_DEFAULTS
+    elif backend == "gemma":
+        defaults = GEMMA_VLM_SAMPLING_DEFAULTS
+    else:
+        defaults = GLM_VLM_SAMPLING_DEFAULTS
+
+    max_new_tokens_raw = getattr(args, "max_new_tokens", None)
+    temperature_raw = getattr(args, "temperature", None)
+    repetition_penalty_raw = getattr(args, "repetition_penalty", None)
+    top_p_raw = getattr(args, "top_p", None)
+    top_k_raw = getattr(args, "top_k", None)
+
+    return {
+        "max_new_tokens": int(defaults["max_new_tokens"] if max_new_tokens_raw is None else max_new_tokens_raw),
+        "temperature": float(defaults["temperature"] if temperature_raw is None else temperature_raw),
+        "repetition_penalty": float(defaults["repetition_penalty"] if repetition_penalty_raw is None else repetition_penalty_raw),
+        "top_p": float(defaults["top_p"] if top_p_raw is None else top_p_raw),
+        "top_k": int(defaults["top_k"] if top_k_raw is None else top_k_raw),
+    }
+
+
 def _json_dumps(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _load_bev_global_origin_xy(las_positions_path: Path) -> tuple[float, float] | None:
+    if not las_positions_path.exists():
+        return None
+
+    try:
+        rows = [ln.strip() for ln in las_positions_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except Exception:
+        return None
+
+    xs: list[float] = []
+    ys: list[float] = []
+    for row in rows:
+        cols = row.split()
+        if not cols:
+            continue
+        if cols[0].lower() == "las_name":
+            continue
+        if len(cols) < 3:
+            continue
+        try:
+            x = float(cols[1])
+            y = float(cols[2])
+        except Exception:
+            continue
+        xs.append(x)
+        ys.append(y)
+    if not xs or not ys:
+        return None
+    return float(min(xs)), float(max(ys))
+
+
+def _read_large_rgb_image(path: Path) -> Image.Image:
+    img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise RuntimeError(f"Failed to read image via cv2: {path}")
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img_rgb, mode="RGB")
+
+
+def _write_image_cv2(path: Path, image_rgb: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = np.asarray(image_rgb, dtype=np.uint8)
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(f"Expected RGB image array with shape (H,W,3), got {img.shape}")
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    ok, encoded = cv2.imencode(".png", img_bgr)
+    if not ok:
+        raise RuntimeError(f"Failed to encode PNG image for: {path}")
+    encoded.tofile(str(path))
 
 
 def _load_npz_object_array(npz: Any, key: str) -> list[np.ndarray]:
@@ -382,10 +523,13 @@ def _project_points_stats(
     if points_xyz.size == 0:
         return {
             "pixels_xy": np.zeros((0, 2), dtype=np.int32),
+            "total_count": 0,
             "front_count": 0,
             "valid_count": 0,
             "fill_ratio": 0.0,
+            "raw_fill_ratio": 0.0,
             "visible_ratio": 0.0,
+            "full_extent_in_frame": False,
         }
 
     f = float(w) / (2.0 * math.tan(math.radians(float(fov_deg) * 0.5)))
@@ -399,36 +543,60 @@ def _project_points_stats(
     except np.linalg.LinAlgError:
         return {
             "pixels_xy": np.zeros((0, 2), dtype=np.int32),
+            "total_count": int(pts.shape[0]),
             "front_count": 0,
             "valid_count": 0,
             "fill_ratio": 0.0,
+            "raw_fill_ratio": 0.0,
             "visible_ratio": 0.0,
+            "full_extent_in_frame": False,
         }
 
     pts_cam = (trans_mat @ pts_h.T).T
+    total_count = int(pts_cam.shape[0])
     front_mask = pts_cam[:, 2] > 1e-6
     front_pts = pts_cam[front_mask]
     front_count = int(front_pts.shape[0])
     if front_count == 0:
         return {
             "pixels_xy": np.zeros((0, 2), dtype=np.int32),
+            "total_count": total_count,
             "front_count": 0,
             "valid_count": 0,
             "fill_ratio": 0.0,
+            "raw_fill_ratio": 0.0,
             "visible_ratio": 0.0,
+            "full_extent_in_frame": False,
         }
 
     x = f * (front_pts[:, 0] / front_pts[:, 2]) + cx
     y = f * (front_pts[:, 1] / front_pts[:, 2]) + cy
+    raw_x_min = float(np.min(x))
+    raw_x_max = float(np.max(x))
+    raw_y_min = float(np.min(y))
+    raw_y_max = float(np.max(y))
+    raw_bbox_w = max(1.0, raw_x_max - raw_x_min + 1.0)
+    raw_bbox_h = max(1.0, raw_y_max - raw_y_min + 1.0)
+    raw_fill_ratio = float(max(raw_bbox_w / float(w), raw_bbox_h / float(h)))
+    full_extent_in_frame = bool(
+        front_count == total_count
+        and raw_x_min >= 0.0
+        and raw_x_max < float(w)
+        and raw_y_min >= 0.0
+        and raw_y_max < float(h)
+    )
     valid = (x >= 0.0) & (x < float(w)) & (y >= 0.0) & (y < float(h))
     valid_count = int(np.count_nonzero(valid))
     if valid_count == 0:
         return {
             "pixels_xy": np.zeros((0, 2), dtype=np.int32),
+            "total_count": total_count,
             "front_count": front_count,
             "valid_count": 0,
             "fill_ratio": 0.0,
+            "raw_fill_ratio": raw_fill_ratio,
             "visible_ratio": 0.0,
+            "full_extent_in_frame": full_extent_in_frame,
         }
 
     xv = x[valid]
@@ -453,10 +621,13 @@ def _project_points_stats(
     visible_ratio = float(valid_count / max(1, front_count))
     return {
         "pixels_xy": pixels_xy,
+        "total_count": total_count,
         "front_count": front_count,
         "valid_count": valid_count,
         "fill_ratio": fill_ratio,
+        "raw_fill_ratio": raw_fill_ratio,
         "visible_ratio": visible_ratio,
+        "full_extent_in_frame": full_extent_in_frame,
     }
 
 
@@ -475,54 +646,183 @@ def _estimate_view_distance(
 ) -> tuple[float, dict[str, Any]]:
     obj_center = np.asarray(object_center_xyz, dtype=np.float32).reshape(3)
     view_dir = _normalize_dir_xy(np.asarray(forward_xy, dtype=np.float32).reshape(2))
-    target = min(0.98, max(0.2, float(target_fill_ratio)))
-    d = max(float(distance_min), min(float(distance_max), 8.0))
+    _ = float(target_fill_ratio)  # kept for backward-compatible signature
+    min_d = max(1e-3, float(distance_min))
+    max_d = max(min_d, float(distance_max))
 
-    final_stats: dict[str, Any] = {
-        "fill_ratio": 0.0,
-        "visible_ratio": 0.0,
-        "front_count": 0,
-        "valid_count": 0,
-    }
-    for _ in range(max(1, int(max_iters))):
+    def _eval(distance: float) -> dict[str, Any]:
         cam_center = np.asarray(
             [
-                obj_center[0] - view_dir[0] * d,
-                obj_center[1] - view_dir[1] * d,
+                obj_center[0] - view_dir[0] * float(distance),
+                obj_center[1] - view_dir[1] * float(distance),
                 float(station_z),
             ],
             dtype=np.float32,
         )
-        extrinsic = _build_view_extrinsic(cam_center, view_dir)
-        stats = _project_points_stats(
+        return _project_points_stats(
             object_points_xyz,
-            extrinsic=extrinsic,
+            extrinsic=_build_view_extrinsic(cam_center, view_dir),
             img_shape=img_shape,
             fov_deg=fov_deg,
         )
-        final_stats = {
+
+    def _summary(stats: dict[str, Any]) -> dict[str, Any]:
+        return {
             "fill_ratio": float(stats["fill_ratio"]),
+            "raw_fill_ratio": float(stats["raw_fill_ratio"]),
             "visible_ratio": float(stats["visible_ratio"]),
+            "full_extent_in_frame": bool(stats["full_extent_in_frame"]),
+            "total_count": int(stats["total_count"]),
             "front_count": int(stats["front_count"]),
             "valid_count": int(stats["valid_count"]),
         }
 
-        fill = float(stats["fill_ratio"])
-        visible_ratio = float(stats["visible_ratio"])
-        if fill <= 0.0 or int(stats["valid_count"]) <= 8:
-            d = min(float(distance_max), d * 1.5)
-            continue
-        if visible_ratio < 0.90:
-            d = min(float(distance_max), d * 1.2)
-            continue
-        if abs(fill - target) <= 0.03:
+    def _is_acceptable(stats: dict[str, Any]) -> bool:
+        return bool(stats["full_extent_in_frame"]) and int(stats["valid_count"]) > 0
+
+    d = max(min_d, min(max_d, 8.0))
+    prev_d = d
+    prev_stats = _eval(prev_d)
+    best_d = prev_d
+    best_stats = prev_stats
+    best_valid = int(prev_stats["valid_count"])
+
+    if _is_acceptable(prev_stats):
+        return float(prev_d), _summary(prev_stats)
+
+    found_d: float | None = None
+    found_stats: dict[str, Any] | None = None
+    for _ in range(max(1, int(max_iters))):
+        if prev_d >= max_d - 1e-6:
             break
+        d = min(max_d, prev_d * 1.5)
+        stats = _eval(d)
+        valid = int(stats["valid_count"])
+        if valid > best_valid:
+            best_valid = valid
+            best_d = d
+            best_stats = stats
+        if _is_acceptable(stats):
+            found_d = d
+            found_stats = stats
+            break
+        prev_d = d
+        prev_stats = stats
 
-        scale = fill / max(target, 1e-6)
-        d = d * scale
-        d = max(float(distance_min), min(float(distance_max), d))
+    if found_d is None or found_stats is None:
+        return float(best_d), _summary(best_stats)
 
-    return float(d), final_stats
+    low = prev_d
+    high = found_d
+    high_stats = found_stats
+    for _ in range(max(1, int(max_iters))):
+        if high - low <= 1e-3:
+            break
+        mid = 0.5 * (low + high)
+        mid_stats = _eval(mid)
+        if _is_acceptable(mid_stats):
+            high = mid
+            high_stats = mid_stats
+        else:
+            low = mid
+
+    return float(high), _summary(high_stats)
+
+
+def _expand_distance_until_full_extent(
+    object_points_xyz: np.ndarray,
+    *,
+    object_center_xyz: np.ndarray,
+    station_z: float,
+    forward_xy: np.ndarray,
+    img_shape: tuple[int, int],
+    fov_deg: float,
+    target_fill_ratio: float,
+    initial_distance: float,
+    distance_max: float,
+    max_iters: int,
+) -> tuple[float, dict[str, Any]]:
+    obj_center = np.asarray(object_center_xyz, dtype=np.float32).reshape(3)
+    view_dir = _normalize_dir_xy(np.asarray(forward_xy, dtype=np.float32).reshape(2))
+    _ = float(target_fill_ratio)  # kept for backward-compatible signature
+    max_d = max(1e-3, float(distance_max))
+    d = max(1e-3, min(max_d, float(initial_distance)))
+
+    def _eval(distance: float) -> dict[str, Any]:
+        cam_center = np.asarray(
+            [
+                obj_center[0] - view_dir[0] * float(distance),
+                obj_center[1] - view_dir[1] * float(distance),
+                float(station_z),
+            ],
+            dtype=np.float32,
+        )
+        return _project_points_stats(
+            object_points_xyz,
+            extrinsic=_build_view_extrinsic(cam_center, view_dir),
+            img_shape=img_shape,
+            fov_deg=fov_deg,
+        )
+
+    def _summary(stats: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "fill_ratio": float(stats["fill_ratio"]),
+            "raw_fill_ratio": float(stats["raw_fill_ratio"]),
+            "visible_ratio": float(stats["visible_ratio"]),
+            "full_extent_in_frame": bool(stats["full_extent_in_frame"]),
+            "total_count": int(stats["total_count"]),
+            "front_count": int(stats["front_count"]),
+            "valid_count": int(stats["valid_count"]),
+        }
+
+    def _is_acceptable(stats: dict[str, Any]) -> bool:
+        return bool(stats["full_extent_in_frame"]) and int(stats["valid_count"]) > 0
+
+    prev_d = d
+    prev_stats = _eval(prev_d)
+    best_d = prev_d
+    best_stats = prev_stats
+    best_valid = int(prev_stats["valid_count"])
+    if _is_acceptable(prev_stats):
+        return float(prev_d), _summary(prev_stats)
+
+    found_d: float | None = None
+    found_stats: dict[str, Any] | None = None
+    for _ in range(max(1, int(max_iters))):
+        if prev_d >= max_d - 1e-6:
+            break
+        d = min(max_d, prev_d * 1.5)
+        stats = _eval(d)
+        valid = int(stats["valid_count"])
+        if valid > best_valid:
+            best_valid = valid
+            best_d = d
+            best_stats = stats
+        if _is_acceptable(stats):
+            found_d = d
+            found_stats = stats
+            break
+        prev_d = d
+        prev_stats = stats
+
+    if found_d is None or found_stats is None:
+        return float(best_d), _summary(best_stats)
+
+    low = prev_d
+    high = found_d
+    high_stats = found_stats
+    for _ in range(max(1, int(max_iters))):
+        if high - low <= 1e-3:
+            break
+        mid = 0.5 * (low + high)
+        mid_stats = _eval(mid)
+        if _is_acceptable(mid_stats):
+            high = mid
+            high_stats = mid_stats
+        else:
+            low = mid
+
+    return float(high), _summary(high_stats)
 
 
 def _flat_indices_to_xy(flat_indices: np.ndarray, *, img_width: int, img_height: int) -> np.ndarray:
@@ -537,6 +837,52 @@ def _flat_indices_to_xy(flat_indices: np.ndarray, *, img_width: int, img_height:
     x = (arr % int(img_width)).astype(np.int32, copy=False)
     xy = np.stack([x, y], axis=1)
     return np.unique(xy, axis=0).astype(np.int32, copy=False)
+
+
+def _tight_crop_from_pixels(
+    image: Image.Image,
+    pixel_xy: np.ndarray,
+    *,
+    pad_px: int = 4,
+) -> tuple[Image.Image, dict[str, Any]]:
+    img = image.convert("RGB")
+    w, h = img.size
+    coords = np.asarray(pixel_xy, dtype=np.int32).reshape(-1, 2)
+    if coords.shape[0] == 0:
+        crop_w = min(512, w)
+        crop_h = min(512, h)
+        x0 = (w - crop_w) // 2
+        y0 = (h - crop_h) // 2
+    else:
+        pad = max(0, int(pad_px))
+        x_min = int(coords[:, 0].min()) - pad
+        x_max = int(coords[:, 0].max()) + pad
+        y_min = int(coords[:, 1].min()) - pad
+        y_max = int(coords[:, 1].max()) + pad
+        x0 = int(x_min)
+        y0 = int(y_min)
+        crop_w = max(1, int(x_max - x_min + 1))
+        crop_h = max(1, int(y_max - y_min + 1))
+
+    canvas = Image.new("RGB", (crop_w, crop_h), (0, 0, 0))
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(w, x0 + crop_w)
+    src_y1 = min(h, y0 + crop_h)
+    if src_x1 > src_x0 and src_y1 > src_y0:
+        patch = img.crop((src_x0, src_y0, src_x1, src_y1))
+        dst_x0 = src_x0 - x0
+        dst_y0 = src_y0 - y0
+        canvas.paste(patch, (dst_x0, dst_y0))
+
+    meta = {
+        "crop_x0": int(x0),
+        "crop_y0": int(y0),
+        "crop_w": int(crop_w),
+        "crop_h": int(crop_h),
+        "pad_px": int(max(0, int(pad_px))),
+    }
+    return canvas, meta
 
 
 def _select_nearest_station(stations: list[dict[str, Any]], object_xy_center: np.ndarray) -> dict[str, Any] | None:
@@ -565,13 +911,32 @@ def _render_instance_view(
     view_dir = _normalize_dir_xy(np.asarray(view_dir_xy, dtype=np.float32).reshape(2))
 
     if fixed_distance_m is not None and np.isfinite(float(fixed_distance_m)) and float(fixed_distance_m) > 0:
-        distance = max(
+        initial_distance = max(
             float(args.front_distance_min),
             min(float(args.front_distance_max), float(fixed_distance_m)),
         )
+        distance, fixed_projection_stats = _expand_distance_until_full_extent(
+            object_points_xyz,
+            object_center_xyz=obj_center,
+            station_z=float(station_xyz[2]),
+            forward_xy=view_dir,
+            img_shape=img_shape,
+            fov_deg=float(args.front_fov_deg),
+            target_fill_ratio=float(args.target_fill_ratio),
+            initial_distance=float(initial_distance),
+            distance_max=float(args.front_distance_max),
+            max_iters=int(args.front_distance_iters),
+        )
+        distance = max(
+            float(args.front_distance_min),
+            min(float(args.front_distance_max), float(distance)),
+        )
         distance_stats = {
             "mode": "fixed_from_front",
+            "initial_distance_m": float(initial_distance),
             "distance_m": float(distance),
+            "extent_expanded": bool(float(distance) > float(initial_distance) + 1e-6),
+            "projection_stats": fixed_projection_stats,
         }
     else:
         distance, distance_stats = _estimate_view_distance(
@@ -596,6 +961,15 @@ def _render_instance_view(
         dtype=np.float32,
     )
     extrinsic = _build_view_extrinsic(camera_center, view_dir)
+    proj_stats = _project_points_stats(
+        object_points_xyz,
+        extrinsic=extrinsic,
+        img_shape=img_shape,
+        fov_deg=float(args.front_fov_deg),
+    )
+    extent_pixels_xy = np.asarray(proj_stats["pixels_xy"], dtype=np.int32).reshape(-1, 2)
+    if extent_pixels_xy.shape[0] == 0:
+        return None
 
     rgb_img, _, _, render_info = pc2img_soft(
         object_points_xyz,
@@ -612,21 +986,11 @@ def _render_instance_view(
         img_width=int(img_shape[1]),
         img_height=int(img_shape[0]),
     )
-    if pixels_xy.shape[0] == 0:
-        proj_stats = _project_points_stats(
-            object_points_xyz,
-            extrinsic=extrinsic,
-            img_shape=img_shape,
-            fov_deg=float(args.front_fov_deg),
-        )
-        pixels_xy = np.asarray(proj_stats["pixels_xy"], dtype=np.int32).reshape(-1, 2)
-        if pixels_xy.shape[0] == 0:
-            return None
 
-    crop_img, crop_meta = _adaptive_crop_from_pixels(
+    crop_img, crop_meta = _tight_crop_from_pixels(
         Image.fromarray(np.asarray(rgb_img, dtype=np.uint8), mode="RGB"),
-        pixels_xy,
-        fill_ratio=float(args.target_fill_ratio),
+        extent_pixels_xy,
+        pad_px=int(getattr(args, "front_crop_pad_px", 4)),
     )
     crop_img = _downsample_if_needed(crop_img, max_side=int(args.max_image_side))
 
@@ -639,6 +1003,16 @@ def _render_instance_view(
         "crop_meta": crop_meta,
         "crop_size_wh": [int(crop_img.size[0]), int(crop_img.size[1])],
         "hit_pixels": int(pixels_xy.shape[0]),
+        "extent_pixels": int(extent_pixels_xy.shape[0]),
+        "projection_stats": {
+            "total_count": int(proj_stats["total_count"]),
+            "front_count": int(proj_stats["front_count"]),
+            "valid_count": int(proj_stats["valid_count"]),
+            "fill_ratio": float(proj_stats["fill_ratio"]),
+            "raw_fill_ratio": float(proj_stats["raw_fill_ratio"]),
+            "visible_ratio": float(proj_stats["visible_ratio"]),
+            "full_extent_in_frame": bool(proj_stats["full_extent_in_frame"]),
+        },
     }
     return crop_img, meta
 
@@ -815,7 +1189,7 @@ def _adaptive_crop_from_pixels(image: Image.Image, pixel_xy: np.ndarray, *, fill
     return canvas, meta
 
 
-def _fixed_context_crop(image: Image.Image, center_xy: tuple[int, int], size: int) -> Image.Image:
+def _fixed_context_crop(image: Image.Image, center_xy: tuple[int, int], size: int) -> tuple[Image.Image, dict[str, int]]:
     img = image.convert("RGB")
     cx, cy = int(center_xy[0]), int(center_xy[1])
     crop_w = int(size)
@@ -834,45 +1208,57 @@ def _fixed_context_crop(image: Image.Image, center_xy: tuple[int, int], size: in
         dst_x0 = src_x0 - x0
         dst_y0 = src_y0 - y0
         canvas.paste(patch, (dst_x0, dst_y0))
-    return canvas
+    meta = {
+        "crop_x0": int(x0),
+        "crop_y0": int(y0),
+        "crop_w": int(crop_w),
+        "crop_h": int(crop_h),
+    }
+    return canvas, meta
 
 
 def _annotate_bev_global_image(
     *,
-    global_image: Image.Image,
+    context_image: Image.Image,
+    context_crop_meta: dict[str, Any],
     semantic: dict[str, Any],
     geometry: dict[str, Any],
     bev_resolution: float,
     output_path: Path,
 ) -> Path:
-    img = global_image.convert("RGB").copy()
+    img = context_image.convert("RGB").copy()
     draw = ImageDraw.Draw(img)
 
     functional_type = semantic.get("functional_type")
     shape = semantic.get("shape")
-    circle_center_xy = geometry.get("circle_center_xy")
+    circle_center_global_xy = geometry.get("circle_center_global_xy")
+    circle_center_px = geometry.get("circle_center_px")
     circle_radius_m = geometry.get("circle_radius_m")
 
     lines = [
         f"functional_type: {functional_type}",
         f"shape: {shape}",
         f"circle_radius_m: {circle_radius_m}",
-        f"circle_center_xy: {circle_center_xy}",
+        f"circle_center_global_xy: {circle_center_global_xy}",
     ]
     text = "\n".join(lines)
     draw.rectangle((10, 10, 560, 130), fill=(0, 0, 0))
     draw.multiline_text((18, 18), text, fill=(255, 255, 255), spacing=4)
 
     try:
-        center = np.asarray(circle_center_xy, dtype=np.float32).reshape(-1)
+        center_px = np.asarray(circle_center_px, dtype=np.float32).reshape(-1)
         radius_m = float(circle_radius_m)
+        crop_x0 = float(context_crop_meta.get("crop_x0", 0))
+        crop_y0 = float(context_crop_meta.get("crop_y0", 0))
     except Exception:
-        center = np.asarray([], dtype=np.float32)
+        center_px = np.asarray([], dtype=np.float32)
         radius_m = float("nan")
+        crop_x0 = 0.0
+        crop_y0 = 0.0
 
-    if center.size >= 2 and np.isfinite(radius_m) and radius_m > 0 and float(bev_resolution) > 1e-8:
-        cx = float(center[0]) / float(bev_resolution)
-        cy = float(center[1]) / float(bev_resolution)
+    if center_px.size >= 2 and np.isfinite(radius_m) and radius_m > 0 and float(bev_resolution) > 1e-8:
+        cx = float(center_px[0]) - crop_x0
+        cy = float(center_px[1]) - crop_y0
         radius_px = float(radius_m) / float(bev_resolution)
         if np.isfinite(cx) and np.isfinite(cy) and np.isfinite(radius_px):
             x0 = cx - radius_px
@@ -882,64 +1268,7 @@ def _annotate_bev_global_image(
             draw.ellipse((x0, y0, x1, y1), outline=(255, 60, 60), width=3)
             draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=(60, 220, 255))
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(output_path)
-    return output_path
-
-
-def _to_pretty_json_text(payload: Any, *, max_chars: int = 2400) -> str:
-    try:
-        if isinstance(payload, (dict, list)):
-            txt = json.dumps(payload, ensure_ascii=False, indent=2)
-        else:
-            txt = str(payload)
-    except Exception:
-        txt = str(payload)
-    txt = txt.strip()
-    if len(txt) > int(max_chars):
-        txt = txt[: int(max_chars)] + "\n...<truncated>"
-    return txt
-
-
-def _annotate_front_render_image(
-    *,
-    image: Image.Image,
-    object_label: str,
-    semantic: dict[str, Any],
-    output_path: Path,
-) -> Path:
-    img = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(img)
-    w, h = img.size
-
-    semantic_txt = _to_pretty_json_text(semantic, max_chars=1600)
-    raw_lines = [
-        f"{object_label}",
-        "semantic:",
-        semantic_txt,
-    ]
-
-    wrapped_lines: list[str] = []
-    wrap_width = max(40, min(96, int((w - 40) / 8)))
-    for block in raw_lines:
-        block_lines = str(block).splitlines() or [""]
-        for ln in block_lines:
-            parts = textwrap.wrap(ln, width=wrap_width) or [""]
-            wrapped_lines.extend(parts)
-
-    line_h = 14
-    max_lines = max(10, int((h - 30) / line_h))
-    if len(wrapped_lines) > max_lines:
-        wrapped_lines = wrapped_lines[: max_lines - 1] + ["...<truncated>"]
-    text = "\n".join(wrapped_lines)
-
-    panel_w = min(w - 20, max(280, int(w * 0.72)))
-    panel_h = min(h - 20, 16 + line_h * max(1, len(wrapped_lines)))
-    draw.rectangle((10, 10, 10 + panel_w, 10 + panel_h), fill=(0, 0, 0))
-    draw.multiline_text((18, 18), text, fill=(255, 255, 255), spacing=2)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(output_path)
+    _write_image_cv2(output_path, np.asarray(img, dtype=np.uint8))
     return output_path
 
 
@@ -1004,47 +1333,49 @@ def _load_bev_instances(bev_instances_path: Path) -> list[dict[str, Any]]:
     data = np.load(bev_instances_path, allow_pickle=True)
     out: list[dict[str, Any]] = []
 
-    if "masks" in data.files:
-        masks = np.asarray(data["masks"])
-        if masks.ndim == 4 and masks.shape[1] == 1:
-            masks = masks[:, 0]
-        if masks.ndim == 3:
-            for i in range(masks.shape[0]):
-                pixel_xy = _extract_pixel_xy_from_mask(masks[i])
-                if pixel_xy.shape[0] == 0:
-                    continue
-                out.append(
-                    {
-                        "object_id": int(i),
-                        "class_id": 9,
-                        "pixel_xy": pixel_xy,
-                    }
-                )
+    # By design we only use union_mask as the source of manhole instances.
+    if "union_mask" not in data.files:
         return out
 
-    # Fallback: boxes only.
-    if "boxes" in data.files:
-        boxes = np.asarray(data["boxes"], dtype=np.float32).reshape(-1, 4)
-        for i, box in enumerate(boxes):
-            x0, y0, x1, y1 = [int(round(float(v))) for v in box.tolist()]
-            xs = np.arange(min(x0, x1), max(x0, x1) + 1, dtype=np.int32)
-            ys = np.arange(min(y0, y1), max(y0, y1) + 1, dtype=np.int32)
-            if xs.size == 0 or ys.size == 0:
+    union_mask = np.asarray(data["union_mask"])
+    if union_mask.ndim == 3 and union_mask.shape[0] == 1:
+        union_mask = union_mask[0]
+    if union_mask.ndim != 2:
+        return out
+
+    union_bool = union_mask.astype(bool, copy=False)
+    if not np.any(union_bool):
+        return out
+
+    if cv2 is not None:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            union_bool.astype(np.uint8), connectivity=8
+        )
+        for label_id in range(1, int(num_labels)):
+            area = int(stats[label_id, cv2.CC_STAT_AREA]) if stats.ndim == 2 else 0
+            if area <= 0:
                 continue
-            grid_x, grid_y = np.meshgrid(xs, ys)
-            pixel_xy = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=1)
+            y, x = np.nonzero(labels == label_id)
+            if x.size == 0:
+                continue
             out.append(
                 {
-                    "object_id": int(i),
+                    "object_id": int(label_id - 1),
                     "class_id": 9,
-                    "pixel_xy": pixel_xy,
+                    "pixel_xy": np.stack([x.astype(np.int32), y.astype(np.int32)], axis=1),
                 }
             )
+        return out
+
+    pixel_xy = _extract_pixel_xy_from_mask(union_bool)
+    if pixel_xy.shape[0] > 0:
+        out.append({"object_id": 0, "class_id": 9, "pixel_xy": pixel_xy})
     return out
 
 
-def _run_semantic_glm(
+def _run_semantic_vlm(
     *,
+    vlm_backend: str,
     model: Any | None,
     processor: Any | None,
     image_1: Path,
@@ -1054,18 +1385,20 @@ def _run_semantic_glm(
 ) -> dict[str, Any]:
     if model is None or processor is None:
         return {}
+    sampling = _resolve_vlm_sampling_args(args, vlm_backend=vlm_backend)
     try:
-        return run_dual_image_glm(
+        return run_dual_image_vlm(
+            vlm_backend=vlm_backend,
             model=model,
             processor=processor,
             image_1_path=image_1,
             image_2_path=image_2,
             prompt=prompt,
-            max_new_tokens=int(args.max_new_tokens),
-            temperature=float(args.temperature),
-            repetition_penalty=float(args.repetition_penalty),
-            top_p=float(args.top_p),
-            top_k=int(args.top_k),
+            max_new_tokens=int(sampling["max_new_tokens"]),
+            temperature=float(sampling["temperature"]),
+            repetition_penalty=float(sampling["repetition_penalty"]),
+            top_p=float(sampling["top_p"]),
+            top_k=int(sampling["top_k"]),
         )
     except Exception as exc:
         return {"error": str(exc)}
@@ -1086,6 +1419,7 @@ def run_bev_global(
 
     global_rgb_path = bev_dir / "global_rgb.png"
     bev_instances_path = bev_dir / "global_instances.npz"
+    las_positions_path = bev_dir / "las_positions.txt"
     out_npz = bev_dir / "bev_attributes_global.npz"
     out_json = bev_dir / "bev_attributes_global.json"
     if out_npz.exists() and out_json.exists() and (not args.overwrite):
@@ -1099,7 +1433,10 @@ def run_bev_global(
         _save_records_json(out_json, records)
         return records
 
-    global_img = Image.open(global_rgb_path).convert("RGB")
+    global_img = _read_large_rgb_image(global_rgb_path)
+    global_origin_xy = _load_bev_global_origin_xy(las_positions_path)
+    origin_min_x = global_origin_xy[0] if global_origin_xy is not None else None
+    origin_max_y = global_origin_xy[1] if global_origin_xy is not None else None
     instances = _load_bev_instances(bev_instances_path)
     crop_dir = bev_dir / "task6_bev_crops"
     annotated_dir = bev_dir / "task6_bev_annotated"
@@ -1119,7 +1456,7 @@ def run_bev_global(
             fill_ratio=float(args.target_fill_ratio),
         )
         center = pixel_xy.mean(axis=0)
-        context_crop = _fixed_context_crop(
+        context_crop, context_meta = _fixed_context_crop(
             global_img,
             center_xy=(int(round(float(center[0]))), int(round(float(center[1])))),
             size=int(args.bev_global_size),
@@ -1132,7 +1469,8 @@ def run_bev_global(
 
         semantic = {}
         if bool(run_vlm):
-            semantic = _run_semantic_glm(
+            semantic = _run_semantic_vlm(
+                vlm_backend=str(getattr(args, "vlm_backend", "glm")),
                 model=model,
                 processor=processor,
                 image_1=local_path,
@@ -1145,9 +1483,12 @@ def run_bev_global(
             geometry = compute_manhole_geometry_from_pixels(
                 pixel_xy,
                 resolution_m_per_px=float(args.bev_resolution),
+                global_origin_min_x=origin_min_x,
+                global_origin_max_y=origin_max_y,
             )
         annotated_global_path = _annotate_bev_global_image(
-            global_image=global_img,
+            context_image=context_crop,
+            context_crop_meta=context_meta,
             semantic=semantic if isinstance(semantic, dict) else {},
             geometry=geometry if isinstance(geometry, dict) else {},
             bev_resolution=float(args.bev_resolution),
@@ -1161,7 +1502,11 @@ def run_bev_global(
             "annotated_global_image": str(annotated_global_path),
             "pixel_count": int(pixel_xy.shape[0]),
             "crop_meta": local_meta,
+            "global_origin_xy": [float(origin_min_x), float(origin_max_y)] if (origin_min_x is not None and origin_max_y is not None) else None,
         }
+        geometry_record = dict(geometry) if isinstance(geometry, dict) else {}
+        geometry_record.pop("circle_center_px", None)
+        geometry_record.pop("circle_center_xy", None)
         records.append(
             {
                 "record_id": f"bev:global:manhole:{object_id}",
@@ -1172,7 +1517,7 @@ def run_bev_global(
                 "class_id": int(class_id),
                 "candidate_class_ids": [int(class_id)],
                 "semantic_attributes_json": _json_dumps(semantic if isinstance(semantic, dict) else {}),
-                "geometry_attributes_json": _json_dumps(geometry if isinstance(geometry, dict) else {}),
+                "geometry_attributes_json": _json_dumps(geometry_record),
                 "evidence_json": _json_dumps(evidence),
                 "confidence": confidence,
             }
@@ -1314,6 +1659,10 @@ def run_front_by_scene(
         render_dir.mkdir(parents=True, exist_ok=True)
 
         scene_records: list[dict[str, Any]] = []
+        scene_pole_total = 0
+        scene_pole_proj_success = 0
+        scene_tree_total = 0
+        scene_tree_proj_success = 0
 
         for pole_group in tqdm(pole_groups, desc=f"{scene_name} pole_groups", unit="obj", leave=False):
             pole_id = int(pole_group["pole_group_id"])
@@ -1329,6 +1678,7 @@ def run_front_by_scene(
             object_points_xyz = points_xyz[point_indices.astype(np.int64, copy=False)]
             object_points_rgb = points_rgb[point_indices.astype(np.int64, copy=False)]
             object_center = object_points_xyz.mean(axis=0)
+            scene_pole_total += 1
 
             nearest_station = _select_nearest_station(stations, object_center[:2])
             if nearest_station is None:
@@ -1357,8 +1707,6 @@ def run_front_by_scene(
             semantic: dict[str, Any] = {}
             front_crop_path: Path | None = None
             side_crop_path: Path | None = None
-            front_annotated_path: Path | None = None
-            side_annotated_path: Path | None = None
             front_meta: dict[str, Any] | None = None
             side_meta: dict[str, Any] | None = None
             render_status = "front_render_failed"
@@ -1371,6 +1719,7 @@ def run_front_by_scene(
                 args=args,
             )
             if rendered is not None:
+                scene_pole_proj_success += 1
                 (front_crop, front_meta_raw), side_view = rendered
                 front_meta = dict(front_meta_raw)
                 front_crop_path = render_dir / f"pole_group_{pole_id:05d}_front.png"
@@ -1389,7 +1738,8 @@ def run_front_by_scene(
                     render_status = "ok_front_only_side_reused"
 
                 if bool(run_vlm):
-                    semantic = _run_semantic_glm(
+                    semantic = _run_semantic_vlm(
+                        vlm_backend=str(getattr(args, "vlm_backend", "glm")),
                         model=model,
                         processor=processor,
                         image_1=front_crop_path,
@@ -1397,21 +1747,6 @@ def run_front_by_scene(
                         prompt=build_pole_group_prompt(candidate_class_names),
                         args=args,
                     )
-                    front_annotated_path = render_dir / f"pole_group_{pole_id:05d}_front_annotated.png"
-                    _annotate_front_render_image(
-                        image=front_crop,
-                        object_label=f"pole_group:{pole_id}",
-                        semantic=semantic if isinstance(semantic, dict) else {},
-                        output_path=front_annotated_path,
-                    )
-                    if side_view is not None and side_crop_path is not None:
-                        side_annotated_path = render_dir / f"pole_group_{pole_id:05d}_side90_annotated.png"
-                        _annotate_front_render_image(
-                            image=side_crop,
-                            object_label=f"pole_group:{pole_id}",
-                            semantic=semantic if isinstance(semantic, dict) else {},
-                            output_path=side_annotated_path,
-                        )
 
             evidence = {
                 "task5_final_npz": str(final_npz_path),
@@ -1428,8 +1763,6 @@ def run_front_by_scene(
                 "ground_neighborhood_quantile": float(getattr(args, "ground_neighborhood_quantile", 0.10)),
                 "front_image": str(front_crop_path) if front_crop_path is not None else None,
                 "side_image": str(side_crop_path) if side_crop_path is not None else None,
-                "front_annotated_image": str(front_annotated_path) if front_annotated_path is not None else None,
-                "side_annotated_image": str(side_annotated_path) if side_annotated_path is not None else None,
                 "point_count": int(point_indices.size),
                 "task5_pole_metric_source": str(pole_group.get("metric_source", "")),
                 "render_method": "task2_pc2img_soft_splat",
@@ -1507,14 +1840,13 @@ def run_front_by_scene(
             semantic: dict[str, Any] = {}
             front_crop_path: Path | None = None
             side_crop_path: Path | None = None
-            front_annotated_path: Path | None = None
-            side_annotated_path: Path | None = None
             front_meta: dict[str, Any] | None = None
             side_meta: dict[str, Any] | None = None
             render_status = "skipped_non_tree"
             side_from_front = False
 
             if class_id == 7:
+                scene_tree_total += 1
                 rendered = _render_instance_two_views(
                     object_points_xyz=object_points_xyz,
                     object_points_rgb=object_points_rgb,
@@ -1522,6 +1854,7 @@ def run_front_by_scene(
                     args=args,
                 )
                 if rendered is not None:
+                    scene_tree_proj_success += 1
                     (front_crop, front_meta_raw), side_view = rendered
                     front_meta = dict(front_meta_raw)
                     front_crop_path = render_dir / f"scene_instance_{scene_instance_id:05d}_front.png"
@@ -1540,7 +1873,8 @@ def run_front_by_scene(
                         render_status = "ok_front_only_side_reused"
 
                     if bool(run_vlm):
-                        semantic = _run_semantic_glm(
+                        semantic = _run_semantic_vlm(
+                            vlm_backend=str(getattr(args, "vlm_backend", "glm")),
                             model=model,
                             processor=processor,
                             image_1=front_crop_path,
@@ -1548,21 +1882,6 @@ def run_front_by_scene(
                             prompt=TREE_PROMPT,
                             args=args,
                         )
-                        front_annotated_path = render_dir / f"scene_instance_{scene_instance_id:05d}_front_annotated.png"
-                        _annotate_front_render_image(
-                            image=front_crop,
-                            object_label=f"scene_instance:{scene_instance_id}:class_{class_id}",
-                            semantic=semantic if isinstance(semantic, dict) else {},
-                            output_path=front_annotated_path,
-                        )
-                        if side_view is not None and side_crop_path is not None:
-                            side_annotated_path = render_dir / f"scene_instance_{scene_instance_id:05d}_side90_annotated.png"
-                            _annotate_front_render_image(
-                                image=side_crop,
-                                object_label=f"scene_instance:{scene_instance_id}:class_{class_id}",
-                                semantic=semantic if isinstance(semantic, dict) else {},
-                                output_path=side_annotated_path,
-                            )
                 else:
                     render_status = "front_render_failed"
 
@@ -1588,9 +1907,6 @@ def run_front_by_scene(
                 "render_status": render_status,
                 "side_from_front": bool(side_from_front),
             }
-            if front_annotated_path is not None and side_annotated_path is not None:
-                evidence["front_annotated_image"] = str(front_annotated_path)
-                evidence["side_annotated_image"] = str(side_annotated_path)
             scene_records.append(
                 _build_front_record(
                     scene_name=scene_name,
@@ -1613,6 +1929,11 @@ def run_front_by_scene(
         _save_records_npz(out_npz, scene_records)
         _save_records_json(out_json, scene_records)
         all_records.extend(scene_records)
+        print(
+            f"[task6] front scene={scene_name}: "
+            f"pole_groups projected={scene_pole_proj_success}/{scene_pole_total}, "
+            f"trees projected={scene_tree_proj_success}/{scene_tree_total}"
+        )
 
     return all_records
 
@@ -1634,13 +1955,14 @@ def main() -> None:
     run_geometry = run_stage in {"both", "geometry"}
     run_vlm_requested = run_stage in {"both", "vlm"}
     run_vlm = bool(run_vlm_requested) and (not bool(args.disable_glm))
+    args.model_path = resolve_vlm_model_path(str(getattr(args, "vlm_backend", "glm")), getattr(args, "model_path", None))
 
     model = None
     processor = None
     if run_vlm:
-        model, processor = load_glm_model_and_processor(str(args.model_path))
+        model, processor, args.model_path = load_vlm_model_and_processor(str(args.vlm_backend), str(args.model_path))
     elif run_vlm_requested and bool(args.disable_glm):
-        print("[task6] warning: run-stage requires vlm but --disable-glm is enabled, semantic inference will be skipped.")
+        print("[task6] warning: run-stage requires vlm but VLM inference is disabled, semantic inference will be skipped.")
 
     if not run_bev and not run_front:
         print("[task6] nothing to run: run-branch disables both BEV and Front.")
