@@ -12,6 +12,33 @@ from .Core.pc2img import pc2img
 from .Core.pc2img import pc2img_soft
 from .Core.pc2img import render_img_gpu
 from .utils.label import vectorized_mapping_func, img_label_map, pc_label_map
+try:
+    from pipeline.coord_utils import compute_scene_origin_xy, shift_extrinsic_xy, to_local_xy
+except Exception:
+    def compute_scene_origin_xy(points_xyz: NDArray[np.float32]) -> NDArray[np.float64]:
+        pts = np.asarray(points_xyz)
+        if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
+            return np.zeros((2,), dtype=np.float64)
+        origin = np.asarray(pts[0, :2], dtype=np.float64).reshape(2)
+        if not np.all(np.isfinite(origin)):
+            return np.zeros((2,), dtype=np.float64)
+        return origin
+
+    def to_local_xy(points_xyz: NDArray[np.float32], origin_xy: ArrayLike) -> NDArray[np.float32]:
+        pts = np.asarray(points_xyz)
+        origin = np.asarray(origin_xy, dtype=np.float64).reshape(-1)[:2]
+        out = np.asarray(pts, dtype=np.float64).copy()
+        out[:, 0] -= float(origin[0])
+        out[:, 1] -= float(origin[1])
+        return out.astype(pts.dtype, copy=False)
+
+    def shift_extrinsic_xy(extrinsic: ArrayLike, origin_xy: ArrayLike) -> NDArray[np.float32]:
+        mat = np.asarray(extrinsic)
+        origin = np.asarray(origin_xy, dtype=np.float64).reshape(-1)[:2]
+        out = np.asarray(mat, dtype=np.float64).copy()
+        out[0, 3] -= float(origin[0])
+        out[1, 3] -= float(origin[1])
+        return out.astype(mat.dtype, copy=False)
 
 
 def pc_inference(pc_path: str, output_path: str):
@@ -155,6 +182,8 @@ def pc_proj_preprocess(
         terrain_percentile,
         max_jump,
     )
+    origin_xy = compute_scene_origin_xy(points)
+    points_local = to_local_xy(points, origin_xy).astype(points.dtype, copy=False)
 
     for station_idx in tqdm(range(len(stations))):
         station = stations[station_idx]
@@ -165,17 +194,18 @@ def pc_proj_preprocess(
             depth_img_path = f'{output_path}/{cam_prefix}_depth.png'
             info_path = f'{output_path}/{cam_prefix}.npz'
 
-            cam_extrinsic = np.array(cam_extrinsic)
+            cam_extrinsic = np.array(cam_extrinsic, dtype=np.float32)
+            cam_extrinsic_local = shift_extrinsic_xy(cam_extrinsic, origin_xy)
             # rgb_img, intensity_img, (dist_img, depth_img), (pts_img_indices, pts_indices) = pc2img(
             #     points, colors, intensities, cam_extrinsic,
             #     img_shape=img_shape,
             #     buffer_size=buffer_size,
             # )
             rgb_img, intensity_img, (dist_img, depth_img), (pts_img_indices, pts_indices) = pc2img_soft(
-                points,
+                points_local,
                 colors,
                 intensities,
-                cam_extrinsic,
+                cam_extrinsic_local,
                 img_shape=img_shape,
                 buffer_size=buffer_size,
             )

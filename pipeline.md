@@ -35,7 +35,9 @@
       {scene_name}_instance_seg_final.las
       {scene_name}_instance_seg.npz
       {scene_name}_instance_seg_final.npz
+      {scene_name}_pole_groups_3d_dbscan.las
       {scene_name}_pole_groups_merged.las
+      {scene_name}_pole_anchors.las
       {scene_name}_tree_metrics.npz
       {scene_name}_instance_seg_meta.json
     attributes/
@@ -165,6 +167,11 @@ python GLM-V/inference/batch_scene_classify_glm.py \
 要求：
 1. 无效实例（面积太小或分数过低）在回投阶段过滤。
 2. 场景级跳过：若场景目录下已存在 `sam_mask/`，则该场景默认视为已处理并跳过。
+3. SAM3 与 Grounded-SAM-2 是两个独立可选脚本；运行哪个脚本即选择哪个模型，不需要指定 `--backend`。
+4. 两个脚本输出相同的 `sam_mask` 核心字段，任务5无需区分模型来源。
+5. Grounded-SAM-2 输出的 `scores` 固定使用 GroundingDINO 检测框分数；SAM2 mask score 仅保存为调试字段 `sam2_mask_scores`。
+
+SAM3：
 ```bash
 python sam3/preprocess/batch_scene_sam_from_vlm.py \
   --data-root benchmark \
@@ -172,11 +179,31 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
   --checkpoint sam3/model/sam3.pt \
   --device cuda \
   --sam-resolution 1008 \
-  --confidence-threshold 0
+  --confidence-threshold 0.3
 
 # 如需额外按类别保存单独结果（便于排查）
 # python sam3/preprocess/batch_scene_sam_from_vlm.py --data-root benchmark --save-per-class-artifacts
 ```
+
+Grounded-SAM-2:
+```bash
+python infer/batch_scene_grounded_sam2_from_vlm.py \
+  --data-root benchmark \
+  --device cuda \
+  --sam2-checkpoint checkpoints/sam2.1_hiera_large.pt \
+  --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
+  --grounding-config grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py \
+  --grounding-checkpoint gdino_checkpoints/groundingdino_swint_ogc.pth \
+  --box-threshold 0.35 \
+  --text-threshold 0.25
+
+# 如需仅处理 VLM 命中类别，增加 --no-use-all-classes
+# 如需保存逐类别 NPZ 和 mask 可视化，增加 --save-per-class-artifacts
+```
+
+注意：
+1. Grounded-SAM-2 应在 `grounded-sam2` Conda 环境中运行。当前环境需要优先使用环境内的 NVIDIA 动态库，否则可能出现 cuDNN 符号缺失。
+2. 两个脚本默认都写入 `sam_mask/`，且发现该目录后会跳过整个场景。切换模型重新推理前，需要先备份或移走已有 `sam_mask/`。
 
 
 ### 任务5：2D->3D 回投 + 合并 + 冲突归属 + 去噪 + 杆状物聚类
@@ -191,14 +218,14 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 2. 候选实例先做类别门控：同原类别允许合并；仅 `1 电线杆` 与 `2 路灯杆` 允许跨类合并；`3-6`（路牌/交通标志/红绿灯/监控）仅同类合并；`7 行道树` 仅与 `7 行道树` 合并；`8-15` 其余类别仅同类合并。在类别门控通过后，使用双通道合并：主通道为 `point IoU >= threshold`；补充通道用于“同类实例”以及 `1<->2` 组合（`XY` 中心距离足够小）；树木暂不启用该补充通道，先保持当前 `IoU` 合并强度。候选合并后，若 merged instance 点数小于 `min-merged-points`，则直接丢弃，不进入后续处理。
 3. 对保留下来的 merged instance，先按 `w_angle * confidence` 累加类别得分，确定最终类别；点归属前执行冲突删点：若某点同时属于 `1/2` 与 `3/4/5/6`，优先保留 `3/4/5/6` 并从 `1/2` 删除；若某点同时属于树和围栏，则保留树点并从围栏侧剔除；若某点同时属于树实例和其他非树实例，则保留在非树实例中，并从树实例候选点中剔除。
 4. 点级冲突归属：同一点属于多个实例时，按加权总分取最大实例。
-5. 空间去噪（仅非树）：仅对 `class_id != 7` 的实例做空间聚类去噪，保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。树木实例在该步跳过去噪，统一由第 8/9 步树干-树冠后处理完成拆分与清理。
+5. 空间去噪（仅非树）：仅对 `class_id != 7` 的实例做空间聚类去噪，保留最大簇；若最大簇点数小于 `denoise-min-points`，则删除该实例。输入点集超过 `--dbscan-downsample-threshold`（当前默认 `200000`）时，会先做体素下采样后再运行 DBSCAN：通用去噪使用 3D 体素 `--denoise-downsample-voxel`。树木实例在该步跳过去噪，统一由第 8/9 步树干-树冠后处理完成拆分与清理。
 6. 地面点剔除（非围栏）：对除围栏外的类别执行。按实例点云 `z` 值计算 `z_low = q05(z)` 与 `z_high = q95(z)`，并使用相对高度带 `[z_low + 0.2*(z_high-z_low), z_low + 0.8*(z_high-z_low)]` 的支撑点计算水平 `bbox`，向外扩 `2cm`。最终采用保守剔除：仅删除“低高度带（`z <= z_low + 0.2*(z_high-z_low)`）且位于 `bbox` 外”的点。
-7. 围栏重聚类：围栏实例不做上述 bbox 地面点剔除；先对整场景点云执行一次全局 CSF 提取地面掩码，然后仅在围栏分支删除“CSF 判地面且位于围栏实例低高度带（`z <= q05 + r*(q95-q05)`，`r` 为 `--fence-csf-low-band-ratio`）”的点，再把所有围栏非地面点合并后按 `XY` 连通重新聚类；仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
-8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 提取各 station 的位置与高度；对每棵树按 `XY` 质心匹配最近 station，并用该站点 `station_z - 2.0m` 作为该树的地面参考（station 信息异常时回退到全局默认值）。随后将所有树实例中离地 `0.8-1.4m` 的高度带点汇总，在 `XY` 平面执行 DBSCAN 生成树干候选簇。半径仍按该 `0.8-1.4m` 候选簇做 TaubinSVD 圆拟合（半径+残差门控）输出并固化 `dbh_m = 2 * r` 与 `trunk_center_xy`。结果写入 `tree_metrics.npz`，并与 `scene_instance_id` 一一对应；高度改为从独立高度带（例如 `0.8-1.8m`）中补点，但补点范围仅限于“参与该候选树干簇合并的树实例”内部，且补点 `XY` 邻域半径固定为 `0.05m`；高度判定直接使用 `z_max - z_min`，并要求其大于 `tree-trunk-min-height`。当前版本已关闭主方向竖直性门控。
-9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。树木挂接完成后，对每棵树实例再做一次 3D DBSCAN（`--tree-final-denoise-eps`，默认 `0.5m`），仅保留最大连通簇，以去除误投影到远处墙体等离散噪点。 
-10. 杆状物聚类：聚类对象是“点”，不是“实例中心”。从最终实例中提取 `class_id in {1,2,3,4,5,6}` 的全部点，在 3D 空间执行 DBSCAN。默认参数：`eps=0.3`, `min_samples=10`。每个簇记为一个 `pole_group`，汇总 `candidate_class_ids`（来自与簇点相交的成员实例类别）。新增三级过滤：聚类后若簇点数 `< 100` 直接丢弃；若该簇高度差 `z_max-z_min < 0.5m` 直接丢弃（抑制地面箭头等误分割成杆状物）；若拟合直径 `diameter_m > 5.0m` 直接丢弃（抑制明显异常杆体）。
-11. 伪树筛除：先对每个 `pole_group` 按树木同口径（最近站点地面 + `0.8-1.4m` 高度带 + TaubinSVD）计算 `diameter_m/center_xy`。再将“有有效树干锚点”的树实例与 `pole_group` 做唯一匹配；匹配必须同时满足：`center_xy` 距离 `<= 0.35m` 且 `|tree_dbh - pole_diameter| <= 0.3m`。满足条件时判为伪树并直接删除该树实例（不并入杆状物，避免树冠噪点带入杆状物）。
-12. 杆状物聚类 LAS 导出：仅保存杆状物点。按 `pole_group_id` 着色（合并后的杆状物实例着色）。`classification=1`，`cls_id=1`，新增 extra dim：`pole_group_id`、`has_cls_1`、`has_cls_2`、`has_cls_3`、`has_cls_4`、`has_cls_5`、`has_cls_6`。其中 `has_cls_k`（`k=1..6`）规则为：若该合并实例（`pole_group`）包含类别 `k`，则写 `1`，否则写 `0`。最终写盘顺序（调整）：`tree_metrics.npz`、`instance_seg_final.npz`、`instance_seg_final.las` 均放在“伪树筛除”之后统一写出，保证三者一致。`instance_seg_final.npz` 重组（新增约束）：`scene_instance` 仅保留 `7..15` 类（不再保留 `1..6` 的原始 scene_instance 记录）。`1..6` 仅通过 `pole_group` 表达。Task6 回溯点集时统一从该文件读取：`scene_instance_point_indices` 或 `pole_group_point_indices`。
+7. 围栏重聚类：围栏实例不做上述 bbox 地面点剔除；先对整场景点云执行一次全局 CSF 提取地面掩码，然后仅在围栏分支删除“CSF 判地面且位于围栏实例低高度带（`z <= q05 + r*(q95-q05)`，`r` 为 `--fence-csf-low-band-ratio`）”的点，再把所有围栏非地面点合并后按 `XY` 连通重新聚类；输入点集超过 `--dbscan-downsample-threshold` 时，会先做 `XY` 体素下采样 `--fence-downsample-voxel` 再运行 DBSCAN。仅保留点数不少于 `500` 且稳健高度范围 `q95(z)-q05(z) >= 0.5m` 的围栏簇，其余簇直接丢弃。
+8. 树木实例后处理：仅对 `class_id=7` 执行。先从 `effective_stations.json` 提取各 station 的位置与高度；对每棵树按 `XY` 质心匹配最近 station，并用该站点 `station_z - 2.0m` 作为该树的地面参考（station 信息异常时回退到全局默认值）。随后提取每棵树离地 `0.8-1.4m` 的树干候选点，并先按树实例 `XY` 中心做 `10m` 局部分组；每个组内再在 `XY` 平面执行 DBSCAN 生成树干候选簇。若组内输入点数超过 `--dbscan-downsample-threshold`，会先做 `XY` 体素下采样 `--tree-trunk-downsample-voxel` 再运行 DBSCAN。半径仍按该 `0.8-1.4m` 候选簇做 TaubinSVD 圆拟合（半径+残差门控）输出并固化 `dbh_m = 2 * r` 与 `trunk_center_xy`。结果写入 `tree_metrics.npz`，并与 `scene_instance_id` 一一对应；高度改为从独立高度带（例如 `0.8-1.8m`）中补点，但补点范围仅限于“参与该候选树干簇合并的树实例”内部，且补点 `XY` 邻域半径固定为 `0.05m`；高度判定直接使用 `z_max - z_min`，并要求其大于 `tree-trunk-min-height`。当前版本已关闭主方向竖直性门控。
+9. 树冠拆分与挂接：树干锚点生成后，若某树实例的高度带点同时落入多个树干锚点，则按整实例点到各树干中心的 `XY` 最近距离拆分树冠；若仅落入一个树干锚点，则保留为单棵树；若没有树干锚点，则该实例记为“树冠待定”。对每个“树冠待定”实例，使用其所有点的水平质心，找到最近树干中心；若距离小于 `4m`，则把该树冠实例并入对应树木，否则丢弃该树冠待定实例（不进入 `final.las`）。树木挂接完成后，对每棵树实例再做一次 3D DBSCAN（`--tree-final-denoise-eps`，默认 `0.5m`），仅保留最大连通簇，以去除误投影到远处墙体等离散噪点；单树输入点数超过 `--dbscan-downsample-threshold` 时，会先做 `3D` 体素下采样 `--tree-final-downsample-voxel`（当前默认 `0.1m`）再运行 DBSCAN。
+10. 杆状物聚类：聚类对象是“点”，不是“实例中心”。从最终实例中提取 `class_id in {1,2,3,4,5,6}` 的全部点，先做半径密度预滤波（默认 `5cm` 内少于 `5` 个邻居则视作离群点并从杆状物聚类中移除），然后按成员实例 `XY` 中心做 `10m` 局部分组；每个组内再在 3D 空间执行 DBSCAN。默认参数：`eps=0.25`, `min_samples=10`。每个簇记为一个粗 `pole_group`，汇总 `candidate_class_ids`（来自与簇点相交的成员实例类别）。随后对每个粗 `pole_group` 在离地 `0.8-1.4m` 高度带内做 `XY` DBSCAN 查找杆部锚点，并用 TaubinSVD 圆拟合筛选半径 `< 0.25m` 且残差 `<= 0.04m` 的锚点；若同一粗簇存在两个及以上锚点，则按合并前成员实例的水平质心归属到最近锚点并拆成多个 `pole_group`，拆分后点数 `< 100` 的组直接丢弃。之后继续三级过滤：聚类/拆分后若簇点数 `< 100` 直接丢弃；若该簇高度差 `z_max-z_min < 0.5m` 直接丢弃（抑制地面箭头等误分割成杆状物）；若拟合直径 `diameter_m > 5.0m` 直接丢弃（抑制明显异常杆体）。
+11. 伪树筛除：匹配必须同时满足：`center_xy` 距离 `<= 0.35m` 且 `|tree_dbh - pole_diameter| <= 0.3m`。满足条件时判为伪树并直接删除该树实例（不并入杆状物，避免树冠噪点带入杆状物）。
+12. 杆状物聚类 LAS 导出：额外保存 3D DBSCAN 粗聚类结果 `*_pole_groups_3d_dbscan.las` 与杆部锚点高度带点 `*_pole_anchors.las`；最终合并/拆分/过滤后的杆状物点保存为 `*_pole_groups_merged.las`。杆状物 LAS 统一 `classification=1`，`cls_id=1`；合并结果按 `pole_group_id` 着色，并新增 extra dim：`pole_group_id`、`has_cls_1`、`has_cls_2`、`has_cls_3`、`has_cls_4`、`has_cls_5`、`has_cls_6`。其中 `has_cls_k`（`k=1..6`）规则为：若该合并实例（`pole_group`）包含类别 `k`，则写 `1`，否则写 `0`。锚点 LAS 按 `pole_anchor_id` 着色，并携带 `source_pole_group_id`、`anchor_radius`、`anchor_residual`、`anchor_center_x/y`。最终写盘顺序（调整）：`tree_metrics.npz`、`instance_seg_final.npz`、`instance_seg_final.las` 均放在“伪树筛除”之后统一写出，保证三者一致。`instance_seg_final.npz` 重组（新增约束）：`scene_instance` 仅保留 `7..15` 类（不再保留 `1..6` 的原始 scene_instance 记录）。`1..6` 仅通过 `pole_group` 表达。Task6 回溯点集时统一从该文件读取：`scene_instance_point_indices` 或 `pole_group_point_indices`。
 
 输出（每场景）：
 1. `fusion/{scene_name}_instance_seg.las`：主流程实例点 LAS。
@@ -207,8 +234,10 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 4. `fusion/{scene_name}_instance_seg_final.las`：与 compact NPZ 对齐的最终点云（`scene_instance(7..15)` + `pole_group`，杆状物统一类 `1`）。
 5. `fusion/{scene_name}_instance_seg_final.npz`：统一封装 `scene_instance(7..15)` + `pole_group(1..6)`，并携带点级回溯索引。
 6. `fusion/{scene_name}_tree_metrics.npz`：每棵树 `dbh_m` 与 `trunk_center_xy`。
-7. `fusion/{scene_name}_pole_groups_merged.las`：仅杆状物聚类点云，按 `pole_group_id` 着色，并携带 `has_cls_1..has_cls_6` 六个二值字段。
-8. 现有调试文件继续保留：`*_scene_csf_ground.las`、`*_instance_seg_tree_pre_denoise.las`、`*_instance_seg_tree_trunks_*.las`、`*_instance_seg_meta.json`。
+7. `fusion/{scene_name}_pole_groups_3d_dbscan.las`：杆状物 3D DBSCAN 粗聚类结果。
+8. `fusion/{scene_name}_pole_groups_merged.las`：最终杆状物聚类点云，按 `pole_group_id` 着色，并携带 `has_cls_1..has_cls_6` 六个二值字段。
+9. `fusion/{scene_name}_pole_anchors.las`：杆部锚点高度带点云，按 `pole_anchor_id` 着色，并携带锚点拟合指标。
+10. 现有调试文件继续保留：`*_scene_csf_ground.las`、`*_instance_seg_tree_pre_denoise.las`、`*_instance_seg_tree_trunks_*.las`、`*_instance_seg_meta.json`。
 
 默认场景级跳过：
 - 若 `fusion/` 已存在且非空，且未启用 `--overwrite`，则直接跳过该场景。
@@ -218,47 +247,56 @@ python sam3/preprocess/batch_scene_sam_from_vlm.py \
 ```bash
 python ImgProject/pipeline/task5_scene_instance_seg.py \
   --data-root benchmark \
-  --num-workers 2 \
+  --num-workers 1 \
   --iou-threshold 0.25 \
   --merge-xy-distance 0.3 \
   --fov-deg 90 \
   --min-mask-points 100 \
   --min-merged-points 500 \
   --denoise-eps 0.35 \
-  --denoise-min-points 500 \
-  --denoise-dbscan-min-samples 5 \
+  --denoise-min-points 300 \
+  --denoise-dbscan-min-samples 3 \
+  --dbscan-downsample-threshold 200000 \
+  --denoise-downsample-voxel 0.1 \
   --ground-z-quantile 0.05 \
   --ground-support-height 0.20 \
   --ground-bbox-expand 0.02 \
   --ground-support-top-ratio 0.80 \
-  --fence-recluster-eps 0.10 \
-  --fence-min-cluster-points 500 \
+  --fence-recluster-eps 0.20 \
+  --fence-min-cluster-points 300 \
   --fence-min-height 0.50 \
-  --fence-dbscan-min-samples 5 \
+  --fence-dbscan-min-samples 3 \
   --fence-csf-rigidness 3 \
-  --fence-csf-class-threshold 0.35 \
-  --fence-csf-low-band-ratio 0.15 \
+  --fence-csf-class-threshold 0.5 \
+  --fence-csf-low-band-ratio 0.3 \
+  --fence-downsample-voxel 0.1 \
   --tree-trunk-band-min 0.80 \
   --tree-trunk-band-max 1.40 \
   --tree-trunk-height-band-min 0.80 \
   --tree-trunk-height-band-max 1.80 \
-  --tree-trunk-dbscan-eps 0.05 \
-  --tree-trunk-dbscan-min-samples 10 \
-  --tree-trunk-min-points 50 \
+  --tree-trunk-dbscan-eps 0.2 \
+  --tree-trunk-downsample-voxel 0.1 \
+  --tree-trunk-dbscan-min-samples 3 \
+  --tree-trunk-min-points 20 \
   --tree-trunk-min-height 0.50 \
   --tree-trunk-max-radius 0.30 \
   --tree-trunk-max-residual 0.04 \
   --tree-crown-attach-distance 4.0 \
   --tree-final-denoise-eps 0.50 \
-  --pole-cluster-eps 0.3 \
+  --tree-final-downsample-voxel 0.1 \
+  --pole-cluster-eps 0.25 \
   --pole-cluster-min-samples 10 \
+  --pole-prefilter-radius 0.05 \
+  --pole-prefilter-min-neighbors 5 \
   --pole-min-cluster-points 100 \
   --pole-min-height-diff 0.50 \
+  --pole-anchor-dbscan-eps 0.10 \
+  --pole-anchor-dbscan-min-samples 5 \
+  --pole-anchor-max-radius 0.25 \
+  --pole-anchor-max-residual 0.04 \
   --tree-pole-center-merge-distance 0.35 \
   --tree-pole-diameter-diff-max 0.30 \
   --pole-max-diameter-m 5.0 \
-  --no-save-tree-pre-denoise-las \
-  --save-tree-trunk-anchors \
   --save-pole-groups-las
 ```
 
@@ -525,3 +563,6 @@ python ImgProject/pipeline/task6_scene_attribute_extract.py \
   --vlm-backend gemma \
   --model-path gemma4/gemma-4-E4B-it
 ```
+
+
+FRONT_VIEW_TASK456_EXECUTION_PLAN.html，按照这个html执行，要求尽量节省token

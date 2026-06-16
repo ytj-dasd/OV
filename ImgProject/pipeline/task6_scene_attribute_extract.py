@@ -21,6 +21,7 @@ if str(IMGPROJECT_DIR) not in sys.path:
     sys.path.append(str(IMGPROJECT_DIR))
 
 import utils as task5_utils
+from coord_utils import compute_scene_origin_xy, restore_global_xy, to_local_xy
 from pyIMS.Core.pc2img import pc2img_soft
 from task6_geometry_utils import (
     compute_manhole_geometry_from_pixels,
@@ -463,6 +464,98 @@ def _load_stations(projected_dir: Path) -> list[dict[str, Any]]:
             }
         )
     return parsed
+
+
+def _stations_to_local_xy(stations: list[dict[str, Any]], origin_xy: np.ndarray) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for station in stations:
+        row = dict(station)
+        station_xy = np.asarray(row.get("station_xy", np.zeros((2,), dtype=np.float32)), dtype=np.float32).reshape(2)
+        station_xyz = np.asarray(row.get("station_xyz", np.zeros((3,), dtype=np.float32)), dtype=np.float32).reshape(3)
+        row["station_xy_global"] = station_xy.astype(np.float32, copy=False)
+        row["station_xyz_global"] = station_xyz.astype(np.float32, copy=False)
+        row["station_xy"] = to_local_xy(station_xy.reshape(1, 2), origin_xy).reshape(2).astype(np.float32, copy=False)
+        row["station_xyz"] = to_local_xy(station_xyz.reshape(1, 3), origin_xy).reshape(3).astype(np.float32, copy=False)
+        out.append(row)
+    return out
+
+
+def _tree_metrics_to_local_xy(tree_metrics: dict[int, dict[str, Any]], origin_xy: np.ndarray) -> dict[int, dict[str, Any]]:
+    out: dict[int, dict[str, Any]] = {}
+    for scene_instance_id, item in tree_metrics.items():
+        row = dict(item)
+        center = row.get("trunk_center_xy")
+        if isinstance(center, (list, tuple, np.ndarray)):
+            arr = np.asarray(center, dtype=np.float32).reshape(-1)
+            if arr.size >= 2 and np.all(np.isfinite(arr[:2])):
+                row["trunk_center_xy"] = to_local_xy(arr[:2].reshape(1, 2), origin_xy).reshape(2).astype(float).tolist()
+        out[int(scene_instance_id)] = row
+    return out
+
+
+def _pole_groups_to_local_xy(pole_groups: list[dict[str, Any]], origin_xy: np.ndarray) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for group in pole_groups:
+        row = dict(group)
+        center = row.get("center_xy")
+        if isinstance(center, (list, tuple, np.ndarray)):
+            arr = np.asarray(center, dtype=np.float32).reshape(-1)
+            if arr.size >= 2 and np.all(np.isfinite(arr[:2])):
+                row["center_xy"] = to_local_xy(arr[:2].reshape(1, 2), origin_xy).reshape(2).astype(float).tolist()
+        out.append(row)
+    return out
+
+
+def _restore_xy_list_to_global(values: Any, origin_xy: np.ndarray) -> Any:
+    if not isinstance(values, (list, tuple, np.ndarray)):
+        return values
+    try:
+        arr = np.asarray(values, dtype=np.float64)
+    except Exception:
+        return values
+    if arr.ndim == 1:
+        if arr.shape[0] < 2 or not np.all(np.isfinite(arr[:2])):
+            return values
+        restored = restore_global_xy(arr[:2], origin_xy)
+        out = arr.copy()
+        out[:2] = np.asarray(restored, dtype=np.float64).reshape(2)
+        return out.astype(float).tolist()
+    if arr.ndim == 2 and arr.shape[1] >= 2:
+        finite = np.all(np.isfinite(arr[:, :2]), axis=1)
+        if not np.any(finite):
+            return values
+        out = arr.copy()
+        out[finite, :2] = restore_global_xy(out[finite, :2], origin_xy)
+        return out.astype(float).tolist()
+    return values
+
+
+def _restore_front_geometry_to_global_xy(
+    geometry: dict[str, Any],
+    *,
+    origin_xy: np.ndarray,
+) -> dict[str, Any]:
+    out = dict(geometry)
+    if "center_xy" in out:
+        out["center_xy"] = _restore_xy_list_to_global(out.get("center_xy"), origin_xy)
+    if "trunk_center_xy" in out:
+        out["trunk_center_xy"] = _restore_xy_list_to_global(out.get("trunk_center_xy"), origin_xy)
+    if "control_points_xy" in out:
+        out["control_points_xy"] = _restore_xy_list_to_global(out.get("control_points_xy"), origin_xy)
+    return out
+
+
+def _restore_render_meta_to_global_xy(meta: dict[str, Any] | None, origin_xy: np.ndarray) -> dict[str, Any] | None:
+    if not isinstance(meta, dict):
+        return meta
+    out = dict(meta)
+    center = out.get("camera_center_xyz")
+    if isinstance(center, (list, tuple, np.ndarray)):
+        arr = np.asarray(center, dtype=np.float64).reshape(-1)
+        if arr.size >= 3 and np.all(np.isfinite(arr[:2])):
+            restored = restore_global_xy(arr[:3], origin_xy)
+            out["camera_center_xyz"] = np.asarray(restored, dtype=np.float64).reshape(3).astype(float).tolist()
+    return out
 
 
 def _normalize_dir_xy(vec_xy: np.ndarray) -> np.ndarray:
@@ -1644,17 +1737,27 @@ def run_front_by_scene(
                 pass
 
         try:
-            points_xyz, points_rgb, las_path = _load_scene_points(scene_dir)
+            points_xyz_global, points_rgb, las_path = _load_scene_points(scene_dir)
         except Exception:
             continue
+        scene_origin_xy = compute_scene_origin_xy(points_xyz_global)
+        points_xyz = to_local_xy(points_xyz_global, scene_origin_xy).astype(np.float32, copy=False)
         task5_csf_ground_las_path = fusion_dir / f"{scene_name}_scene_csf_ground.las"
         if not task5_csf_ground_las_path.exists():
             task5_csf_ground_las_path = fusion_dir / f"{scene_name}_fence_csf_ground.las"
-        task5_ground_points_xyz = _load_task5_csf_ground_points(task5_csf_ground_las_path)
-        tree_metrics = _load_tree_metrics(tree_metrics_path)
-        scene_instances, pole_groups = _load_scene_front_objects(final_npz_path)
+        task5_ground_points_xyz_global = _load_task5_csf_ground_points(task5_csf_ground_las_path)
+        task5_ground_points_xyz = (
+            None
+            if task5_ground_points_xyz_global is None
+            else to_local_xy(task5_ground_points_xyz_global, scene_origin_xy).astype(np.float32, copy=False)
+        )
+        tree_metrics_global = _load_tree_metrics(tree_metrics_path)
+        tree_metrics = _tree_metrics_to_local_xy(tree_metrics_global, scene_origin_xy)
+        scene_instances, pole_groups_global = _load_scene_front_objects(final_npz_path)
+        pole_groups = _pole_groups_to_local_xy(pole_groups_global, scene_origin_xy)
         projected_dir = scene_dir / "projected_images"
-        stations = _load_stations(projected_dir)
+        stations_global = _load_stations(projected_dir)
+        stations = _stations_to_local_xy(stations_global, scene_origin_xy)
         render_dir = scene_output_dir / "task6_front_renders"
         render_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1686,9 +1789,17 @@ def run_front_by_scene(
                     [float(object_center[0]) - 8.0, float(object_center[1]), float(object_center[2])],
                     dtype=np.float32,
                 )
+                station_center_xyz_global = np.asarray(
+                    restore_global_xy(station_center_xyz, scene_origin_xy),
+                    dtype=np.float32,
+                ).reshape(3)
                 station_idx: int | None = None
             else:
                 station_center_xyz = np.asarray(nearest_station.get("station_xyz", np.asarray([object_center[0], object_center[1], object_center[2]], dtype=np.float32)), dtype=np.float32).reshape(3)
+                station_center_xyz_global = np.asarray(
+                    nearest_station.get("station_xyz_global", nearest_station.get("station_xyz", station_center_xyz)),
+                    dtype=np.float32,
+                ).reshape(3)
                 station_idx = int(nearest_station.get("station_idx", -1))
 
             geometry: dict[str, Any] = {}
@@ -1703,41 +1814,46 @@ def run_front_by_scene(
                     precomputed_diameter_m=pole_group.get("diameter_m"),
                     precomputed_center_xy=pole_group.get("center_xy"),
                 )
+                geometry = _restore_front_geometry_to_global_xy(
+                    geometry,
+                    origin_xy=scene_origin_xy,
+                )
 
             semantic: dict[str, Any] = {}
             front_crop_path: Path | None = None
             side_crop_path: Path | None = None
             front_meta: dict[str, Any] | None = None
             side_meta: dict[str, Any] | None = None
-            render_status = "front_render_failed"
+            render_status = "skipped_render_run_vlm_false"
             side_from_front = False
 
-            rendered = _render_instance_two_views(
-                object_points_xyz=object_points_xyz,
-                object_points_rgb=object_points_rgb,
-                station_center_xyz=station_center_xyz,
-                args=args,
-            )
-            if rendered is not None:
-                scene_pole_proj_success += 1
-                (front_crop, front_meta_raw), side_view = rendered
-                front_meta = dict(front_meta_raw)
-                front_crop_path = render_dir / f"pole_group_{pole_id:05d}_front.png"
-                front_crop.save(front_crop_path)
+            if bool(run_vlm):
+                render_status = "front_render_failed"
+                rendered = _render_instance_two_views(
+                    object_points_xyz=object_points_xyz,
+                    object_points_rgb=object_points_rgb,
+                    station_center_xyz=station_center_xyz,
+                    args=args,
+                )
+                if rendered is not None:
+                    scene_pole_proj_success += 1
+                    (front_crop, front_meta_raw), side_view = rendered
+                    front_meta = _restore_render_meta_to_global_xy(dict(front_meta_raw), scene_origin_xy)
+                    front_crop_path = render_dir / f"pole_group_{pole_id:05d}_front.png"
+                    front_crop.save(front_crop_path)
 
-                side_vlm_path = front_crop_path
-                if side_view is not None:
-                    side_crop, side_meta_raw = side_view
-                    side_meta = dict(side_meta_raw)
-                    side_crop_path = render_dir / f"pole_group_{pole_id:05d}_side90.png"
-                    side_crop.save(side_crop_path)
-                    side_vlm_path = side_crop_path
-                    render_status = "ok_two_views"
-                else:
-                    side_from_front = True
-                    render_status = "ok_front_only_side_reused"
+                    side_vlm_path = front_crop_path
+                    if side_view is not None:
+                        side_crop, side_meta_raw = side_view
+                        side_meta = _restore_render_meta_to_global_xy(dict(side_meta_raw), scene_origin_xy)
+                        side_crop_path = render_dir / f"pole_group_{pole_id:05d}_side90.png"
+                        side_crop.save(side_crop_path)
+                        side_vlm_path = side_crop_path
+                        render_status = "ok_two_views"
+                    else:
+                        side_from_front = True
+                        render_status = "ok_front_only_side_reused"
 
-                if bool(run_vlm):
                     semantic = _run_semantic_vlm(
                         vlm_backend=str(getattr(args, "vlm_backend", "glm")),
                         model=model,
@@ -1755,9 +1871,9 @@ def run_front_by_scene(
                 "source_las": str(las_path),
                 "nearest_station_idx": station_idx,
                 "nearest_station_center_xyz": [
-                    float(station_center_xyz[0]),
-                    float(station_center_xyz[1]),
-                    float(station_center_xyz[2]),
+                    float(station_center_xyz_global[0]),
+                    float(station_center_xyz_global[1]),
+                    float(station_center_xyz_global[2]),
                 ],
                 "ground_neighborhood_radius": float(getattr(args, "ground_neighborhood_radius", 2.0)),
                 "ground_neighborhood_quantile": float(getattr(args, "ground_neighborhood_quantile", 0.10)),
@@ -1812,9 +1928,17 @@ def run_front_by_scene(
                     [float(object_center[0]) - 8.0, float(object_center[1]), float(object_center[2])],
                     dtype=np.float32,
                 )
+                station_center_xyz_global = np.asarray(
+                    restore_global_xy(station_center_xyz, scene_origin_xy),
+                    dtype=np.float32,
+                ).reshape(3)
                 station_idx: int | None = None
             else:
                 station_center_xyz = np.asarray(nearest_station.get("station_xyz", np.asarray([object_center[0], object_center[1], object_center[2]], dtype=np.float32)), dtype=np.float32).reshape(3)
+                station_center_xyz_global = np.asarray(
+                    nearest_station.get("station_xyz_global", nearest_station.get("station_xyz", station_center_xyz)),
+                    dtype=np.float32,
+                ).reshape(3)
                 station_idx = int(nearest_station.get("station_idx", -1))
 
             tree_metric = tree_metrics.get(scene_instance_id) if class_id == 7 else None
@@ -1836,6 +1960,10 @@ def run_front_by_scene(
                     fence_grid_size=float(getattr(args, "fence_centerline_grid_size", 0.10)),
                     fence_knn=int(getattr(args, "fence_centerline_knn", 8)),
                 )
+                geometry = _restore_front_geometry_to_global_xy(
+                    geometry,
+                    origin_xy=scene_origin_xy,
+                )
 
             semantic: dict[str, Any] = {}
             front_crop_path: Path | None = None
@@ -1845,8 +1973,9 @@ def run_front_by_scene(
             render_status = "skipped_non_tree"
             side_from_front = False
 
-            if class_id == 7:
+            if class_id == 7 and bool(run_vlm):
                 scene_tree_total += 1
+                render_status = "front_render_failed"
                 rendered = _render_instance_two_views(
                     object_points_xyz=object_points_xyz,
                     object_points_rgb=object_points_rgb,
@@ -1856,14 +1985,14 @@ def run_front_by_scene(
                 if rendered is not None:
                     scene_tree_proj_success += 1
                     (front_crop, front_meta_raw), side_view = rendered
-                    front_meta = dict(front_meta_raw)
+                    front_meta = _restore_render_meta_to_global_xy(dict(front_meta_raw), scene_origin_xy)
                     front_crop_path = render_dir / f"scene_instance_{scene_instance_id:05d}_front.png"
                     front_crop.save(front_crop_path)
 
                     side_vlm_path = front_crop_path
                     if side_view is not None:
                         side_crop, side_meta_raw = side_view
-                        side_meta = dict(side_meta_raw)
+                        side_meta = _restore_render_meta_to_global_xy(dict(side_meta_raw), scene_origin_xy)
                         side_crop_path = render_dir / f"scene_instance_{scene_instance_id:05d}_side90.png"
                         side_crop.save(side_crop_path)
                         side_vlm_path = side_crop_path
@@ -1872,18 +2001,19 @@ def run_front_by_scene(
                         side_from_front = True
                         render_status = "ok_front_only_side_reused"
 
-                    if bool(run_vlm):
-                        semantic = _run_semantic_vlm(
-                            vlm_backend=str(getattr(args, "vlm_backend", "glm")),
-                            model=model,
-                            processor=processor,
-                            image_1=front_crop_path,
-                            image_2=side_vlm_path,
-                            prompt=TREE_PROMPT,
-                            args=args,
-                        )
+                    semantic = _run_semantic_vlm(
+                        vlm_backend=str(getattr(args, "vlm_backend", "glm")),
+                        model=model,
+                        processor=processor,
+                        image_1=front_crop_path,
+                        image_2=side_vlm_path,
+                        prompt=TREE_PROMPT,
+                        args=args,
+                    )
                 else:
                     render_status = "front_render_failed"
+            elif class_id == 7:
+                render_status = "skipped_render_run_vlm_false"
 
             evidence = {
                 "task5_final_npz": str(final_npz_path),
@@ -1892,9 +2022,9 @@ def run_front_by_scene(
                 "source_las": str(las_path),
                 "nearest_station_idx": station_idx,
                 "nearest_station_center_xyz": [
-                    float(station_center_xyz[0]),
-                    float(station_center_xyz[1]),
-                    float(station_center_xyz[2]),
+                    float(station_center_xyz_global[0]),
+                    float(station_center_xyz_global[1]),
+                    float(station_center_xyz_global[2]),
                 ],
                 "ground_neighborhood_radius": float(getattr(args, "ground_neighborhood_radius", 2.0)),
                 "ground_neighborhood_quantile": float(getattr(args, "ground_neighborhood_quantile", 0.10)),

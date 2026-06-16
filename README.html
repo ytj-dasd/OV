@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>基于 Open-Vocabulary 的道路设施提取</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --paper: #ffffff;
+      --text: #1f2937;
+      --muted: #5f6b7a;
+      --line: #d8dee7;
+      --accent: #0f766e;
+      --accent-soft: #e6f4f1;
+      --tag: #eef2f7;
+      --shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      line-height: 1.75;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .page {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 40px 0 64px;
+    }
+
+    header {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 40px;
+      margin-bottom: 24px;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+      line-height: 1.3;
+      margin: 0 0 14px;
+    }
+
+    h1 {
+      font-size: clamp(30px, 5vw, 48px);
+      letter-spacing: 0;
+    }
+
+    h2 {
+      font-size: 26px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+      margin-top: 4px;
+    }
+
+    h3 {
+      font-size: 21px;
+      margin-top: 26px;
+    }
+
+    h4 {
+      font-size: 17px;
+      color: #334155;
+      margin-top: 22px;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    ul,
+    ol {
+      margin: 0 0 18px 22px;
+      padding: 0;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    strong {
+      color: #172033;
+    }
+
+    .lead {
+      max-width: 880px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    nav {
+      position: sticky;
+      top: 18px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+
+    nav h2 {
+      font-size: 15px;
+      border: 0;
+      padding: 0;
+      margin: 0 0 10px;
+      color: var(--muted);
+    }
+
+    nav ul {
+      list-style: none;
+      margin: 0;
+    }
+
+    nav li {
+      margin: 6px 0;
+    }
+
+    nav a {
+      display: block;
+      border-radius: 6px;
+      padding: 6px 8px;
+      color: #334155;
+    }
+
+    nav a:hover {
+      background: var(--accent-soft);
+      text-decoration: none;
+      color: #0f5f59;
+    }
+
+    main {
+      display: grid;
+      gap: 20px;
+    }
+
+    section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 30px;
+    }
+
+    .callout {
+      background: var(--accent-soft);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 16px 18px;
+      margin: 16px 0 20px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin: 16px 0 20px;
+    }
+
+    .panel {
+      background: #fbfcfe;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+
+    .panel h3,
+    .panel h4 {
+      margin-top: 0;
+    }
+
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 18px;
+      padding: 0;
+      list-style: none;
+    }
+
+    .tags li {
+      margin: 0;
+      background: var(--tag);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 5px 10px;
+      color: #334155;
+      font-size: 14px;
+    }
+
+    .todo {
+      list-style: none;
+      margin-left: 0;
+    }
+
+    .todo li {
+      position: relative;
+      padding-left: 30px;
+    }
+
+    .todo li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 9px;
+      width: 15px;
+      height: 15px;
+      border: 1.5px solid #94a3b8;
+      border-radius: 4px;
+      background: #fff;
+    }
+
+    @media (max-width: 860px) {
+      .page {
+        width: min(100% - 24px, 1120px);
+        padding-top: 18px;
+      }
+
+      header,
+      section {
+        padding: 22px;
+      }
+
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      nav {
+        position: static;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media print {
+      body {
+        background: #fff;
+      }
+
+      .page {
+        width: 100%;
+        padding: 0;
+      }
+
+      header,
+      section,
+      nav {
+        box-shadow: none;
+        border-color: #cbd5e1;
+      }
+
+      nav {
+        display: none;
+      }
+
+      .layout {
+        display: block;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>基于 Open-Vocabulary 的道路设施提取</h1>
+      <p class="lead">本文档用于整理“基于 Open-Vocabulary 的道路设施提取”论文写作思路、实验设计和评估体系。研究目标是利用图像理解模型与彩色点云数据，实现道路设施要素的开放词汇提取、实例分割与属性估计。</p>
+    </header>
+
+    <div class="layout">
+      <nav aria-label="页面目录">
+        <h2>目录</h2>
+        <ul>
+          <li><a href="#framework">论文写作框架</a></li>
+          <li><a href="#dataset">RS30 自采数据集</a></li>
+          <li><a href="#experiments">实验设计</a></li>
+          <li><a href="#evaluation">评估体系</a></li>
+          <li><a href="#todo">待办事项</a></li>
+        </ul>
+      </nav>
+
+      <main>
+        <section id="framework">
+          <h2>论文写作框架</h2>
+
+          <h3>研究现状</h3>
+          <h4>Open-Vocabulary 方法研究现状</h4>
+          <p>围绕开放词汇视觉理解与道路设施提取，重点梳理以下两类方法：</p>
+          <ul>
+            <li><strong>图像开放词汇方法：</strong>分析 Grounding DINO、T-Rex2、SAM、Grounded SAM 等方法在开放类别检测、分割和提示词驱动识别中的能力。</li>
+            <li><strong>点云开放词汇方法：</strong>分析 OpenIns3D 等 3D 开放词汇实例分割方法在彩色点云、室外道路场景和小目标设施上的适用性。</li>
+          </ul>
+
+          <div class="callout">
+            <p><strong>需要重点讨论的问题：</strong></p>
+            <ul>
+              <li>现有 2D 开放词汇模型是否能稳定识别道路设施中的细粒度类别。</li>
+              <li>现有 3D 开放词汇模型是否适合大规模室外道路点云。</li>
+              <li>图像知识如何迁移到彩色点云要素提取任务中。</li>
+              <li>分割结果与道路设施属性估计之间如何建立关联。</li>
+            </ul>
+          </div>
+
+          <h4>点云与图像语义/实例分割研究现状</h4>
+          <p>围绕道路设施提取任务，需要补充传统监督式语义分割与实例分割方法的研究现状，作为 Open-Vocabulary 方法的对照基础。</p>
+          <ul>
+            <li><strong>图像语义/实例分割方法：</strong>分析 Mask R-CNN、Mask2Former、Segment Anything 等方法在道路场景图像中的目标分割能力。</li>
+            <li><strong>点云语义分割方法：</strong>分析 RandLA-Net、KPConv、MinkowskiNet 等方法在室外点云语义理解中的应用。</li>
+            <li><strong>点云实例分割方法：</strong>分析 ISBNet、SPFormer 等方法在道路设施实例分割和跨场景泛化中的表现。</li>
+          </ul>
+
+          <div class="callout">
+            <p><strong>需要重点讨论的问题：</strong></p>
+            <ul>
+              <li>监督式分割方法对训练数据和类别定义的依赖。</li>
+              <li>图像分割方法在遮挡、小目标和远距离目标上的限制。</li>
+              <li>点云分割方法在稀疏点云、杆状物和树木等复杂结构上的表现。</li>
+              <li>传统分割方法与 Open-Vocabulary 方法在类别扩展能力上的差异。</li>
+            </ul>
+          </div>
+
+          <h4>数据集研究现状</h4>
+          <p>数据集综述重点关注道路设施类别是否覆盖完整，尤其是俯视与侧视要素是否同时具备。</p>
+          <ul>
+            <li><strong>数据模态：</strong>图像、点云、彩色点云、融合数据。</li>
+            <li><strong>采集视角：</strong>俯视、正视、侧视、多视角。</li>
+            <li><strong>类别覆盖：</strong>车道线、交通标志、杆状物、道路附属设施、绿化设施、公共服务设施等。</li>
+            <li><strong>标注粒度：</strong>语义分割、实例分割、检测框、属性标签。</li>
+            <li><strong>道路场景复杂度：</strong>城市道路、园区道路、交叉口、居住区道路等。</li>
+          </ul>
+
+          <h3>论文贡献</h3>
+          <ol>
+            <li><strong>提出基于图像知识的彩色点云 Open-Vocabulary 道路设施提取方法。</strong>结合 2D 开放词汇图像分割结果和彩色点云空间结构，实现道路设施实例提取与属性估计。</li>
+            <li><strong>构建并发布 RS30 自采道路设施数据集。</strong>数据覆盖蔡家浜路、财聚路、荣欣路三个真实道路场景，包含俯视道路要素和正视道路设施要素。</li>
+          </ol>
+        </section>
+
+        <section id="dataset">
+          <h2>RS30 自采数据集</h2>
+          <div class="grid">
+            <div class="panel">
+              <h3>采集道路</h3>
+              <ul class="tags">
+                <li>蔡家浜路</li>
+                <li>财聚路</li>
+                <li>荣欣路</li>
+              </ul>
+            </div>
+            <div class="panel">
+              <h3>俯视要素</h3>
+              <ul class="tags">
+                <li>车道线</li>
+                <li>转向箭头</li>
+                <li>斑马线</li>
+                <li>井盖</li>
+                <li>人行道</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>正视要素</h3>
+            <ul class="tags">
+              <li>电线杆</li>
+              <li>路灯杆</li>
+              <li>路牌</li>
+              <li>交通标志</li>
+              <li>红绿灯</li>
+              <li>监控</li>
+              <li>行道树</li>
+              <li>果壳箱</li>
+              <li>消防栓</li>
+              <li>电箱</li>
+              <li>雕塑</li>
+              <li>座椅</li>
+              <li>交通锥</li>
+              <li>柱墩</li>
+              <li>围栏</li>
+            </ul>
+          </div>
+        </section>
+
+        <section id="experiments">
+          <h2>实验设计</h2>
+
+          <h3>Open-Vocabulary 方法对比</h3>
+          <div class="grid">
+            <div class="panel">
+              <h4>2D Open-Vocabulary 方法</h4>
+              <ul>
+                <li>Grounded SAM 推理与集成方法：已实现，重点在财聚路和荣欣路上测试。</li>
+                <li>Vision Banana：暂未开源，作为潜在对比方法或讨论对象。</li>
+                <li>Qwen3-VL-Seg：暂未开源，作为潜在对比方法或讨论对象。</li>
+              </ul>
+            </div>
+            <div class="panel">
+              <h4>3D Open-Vocabulary 方法</h4>
+              <ul>
+                <li>OpenIns3D 推理。</li>
+              </ul>
+              <p>重点评估其在室外道路设施点云上的泛化能力、复杂结构识别能力，以及与 2D 图像知识驱动方法的互补性。</p>
+            </div>
+          </div>
+
+          <h3>点云实例提取方法跨场景泛化性对比</h3>
+          <ul>
+            <li><strong>训练场景：</strong>蔡家浜路、WHU-Urban3D Training。</li>
+            <li><strong>测试场景：</strong>财聚路、荣欣路。</li>
+            <li><strong>对比模型：</strong>ISBNet、SPFormer。</li>
+          </ul>
+
+          <h3>实例后处理对比与消融实验</h3>
+          <ul>
+            <li><strong>双通道合并：</strong>验证俯视与正视结果融合对实例完整性的提升。</li>
+            <li><strong>杆状物后处理：</strong>验证对电线杆、路灯杆、路牌杆等细长结构的实例分离能力。</li>
+            <li><strong>树木后处理：</strong>验证对行道树树冠、树干和相邻树木实例分离的改善效果。</li>
+          </ul>
+          <p>建议设置基线方法、单模块消融和完整方法三类实验配置。</p>
+        </section>
+
+        <section id="evaluation">
+          <h2>评估体系</h2>
+
+          <h3>实例级评价指标</h3>
+          <ul>
+            <li><strong>Precision：</strong>预测正确的实例数量 / 预测实例总数。</li>
+            <li><strong>Recall：</strong>预测正确的实例数量 / 真值实例总数。</li>
+            <li><strong>F1-Score：</strong>Precision 与 Recall 的调和平均。</li>
+          </ul>
+
+          <h3>实例匹配规则</h3>
+          <ul>
+            <li>当预测实例与真值实例的 IoU &gt; 0.5 时，视为正确匹配。</li>
+            <li>每个真值实例最多匹配一个预测实例。</li>
+            <li>每个预测实例最多匹配一个真值实例。</li>
+          </ul>
+
+          <h3>指标类别范围</h3>
+
+          <h3>真值获取方案</h3>
+          <ol>
+            <li><strong>人工统计实例数量：</strong>适用于快速验证方法召回能力，成本较低，但难以计算严格 IoU。</li>
+            <li><strong>实例分割真值标注：</strong>适用于完整论文实验，可支持 Precision、Recall、F1-Score 和 IoU 匹配评估，但标注成本较高。</li>
+          </ol>
+          <p>建议初期采用人工统计建立快速评估表，论文核心实验选取代表性道路片段进行实例分割真值标注。</p>
+        </section>
+
+        <section id="todo">
+          <h2>待办事项</h2>
+          <ul class="todo">
+            <li>补充 Open-Vocabulary 图像与点云方法综述。</li>
+            <li>补充点云与图像语义/实例分割研究现状。</li>
+            <li>梳理道路设施相关公开数据集，并统计俯视与正视类别覆盖情况。</li>
+            <li>完成 RS30 数据集类别定义、采集范围和标注规范。</li>
+            <li>在财聚路、荣欣路上测试 Grounded SAM 推理与集成方法。</li>
+            <li>完成 OpenIns3D 推理实验。</li>
+            <li>完成 ISBNet、SPFormer 跨场景泛化实验。</li>
+            <li>设计并运行双通道合并、杆状物后处理、树木后处理消融实验。</li>
+            <li>确定人工统计与实例分割真值标注的评估范围。</li>
+          </ul>
+        </section>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

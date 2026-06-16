@@ -21,6 +21,20 @@ from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 
 from tqdm import tqdm
+try:
+    from .coord_utils import (
+        compute_scene_origin_xy,
+        restore_global_xy,
+        shift_extrinsic_xy,
+        to_local_xy,
+    )
+except Exception:
+    from coord_utils import (  # type: ignore[no-redef]
+        compute_scene_origin_xy,
+        restore_global_xy,
+        shift_extrinsic_xy,
+        to_local_xy,
+    )
 
 try:
     import CSF
@@ -272,7 +286,12 @@ def _parse_image_stem(image_stem: str) -> tuple[int, str] | None:
     except ValueError:
         return None
 
-def _effective_extrinsic_for_image_stem(stations: list[dict[str, Any]] | None, image_stem: str) -> np.ndarray | None:
+def _effective_extrinsic_for_image_stem(
+    stations: list[dict[str, Any]] | None,
+    image_stem: str,
+    *,
+    origin_xy: np.ndarray | None = None,
+) -> np.ndarray | None:
     if not stations:
         return None
     parsed = _parse_image_stem(image_stem)
@@ -290,17 +309,22 @@ def _effective_extrinsic_for_image_stem(stations: list[dict[str, Any]] | None, i
         return None
     if extrinsic.shape != (4, 4):
         return None
+    if origin_xy is not None:
+        try:
+            extrinsic = shift_extrinsic_xy(extrinsic, origin_xy)
+        except Exception:
+            return None
     return extrinsic
 
 def _mapped_point_depths(points_xyz: np.ndarray, pts_indices: np.ndarray, extrinsic: np.ndarray | None) -> np.ndarray | None:
     if extrinsic is None or pts_indices.size == 0:
         return None
     try:
-        trans_mat = np.linalg.inv(np.asarray(extrinsic, dtype=np.float32))[:3, :]
+        trans_mat = np.linalg.inv(np.asarray(extrinsic, dtype=np.float64))[:3, :]
     except np.linalg.LinAlgError:
         return None
-    pts = points_xyz[pts_indices.astype(np.int64, copy=False)]
-    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1), dtype=np.float32)])
+    pts = np.asarray(points_xyz[pts_indices.astype(np.int64, copy=False)], dtype=np.float64)
+    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1), dtype=np.float64)])
     pts_cam = (trans_mat @ pts_h.T).T
     return pts_cam[:, 2].astype(np.float32, copy=False)
 
@@ -465,6 +489,7 @@ def collect_scene_candidates(
     fov_deg: float,
     min_mask_points: int,
     backproject_depth_threshold: float = 0.20,
+    origin_xy: np.ndarray | None = None,
 ) -> tuple[list[CandidateInstance], dict[str, int]]:
     projected_dir = scene_dir / "projected_images"
     sam_dir = scene_dir / "sam_mask"
@@ -510,7 +535,11 @@ def collect_scene_candidates(
         point_depths = _mapped_point_depths(
             points_xyz,
             pts_indices,
-            _effective_extrinsic_for_image_stem(effective_stations, image_stem),
+            _effective_extrinsic_for_image_stem(
+                effective_stations,
+                image_stem,
+                origin_xy=origin_xy,
+            ),
         )
 
         image_shape = tuple(int(x) for x in dist_img.shape)
@@ -639,6 +668,61 @@ def merge_candidates(
 
     return merged_instances, candidate_to_instance
 
+
+def _point_membership_mask(
+    *,
+    num_points: int,
+    point_chunks: list[np.ndarray],
+) -> np.ndarray:
+    mask = np.zeros((int(num_points),), dtype=bool)
+    if mask.size == 0:
+        return mask
+    for chunk in point_chunks:
+        pts = np.asarray(chunk, dtype=np.int32).reshape(-1)
+        if pts.size == 0:
+            continue
+        valid = (pts >= 0) & (pts < int(num_points))
+        pts = pts[valid].astype(np.int64, copy=False)
+        if pts.size == 0:
+            continue
+        mask[pts] = True
+    return mask
+
+
+def _group_tree_instance_indices_by_xy_distance(
+    centers_xy: np.ndarray,
+    *,
+    max_distance: float,
+) -> list[list[int]]:
+    centers = np.asarray(centers_xy, dtype=np.float32).reshape(-1, 2)
+    n = int(centers.shape[0])
+    if n == 0:
+        return []
+    if n == 1:
+        return [[0]]
+
+    max_dist = float(max_distance)
+    if (not np.isfinite(max_dist)) or max_dist <= 0.0:
+        return [[idx] for idx in range(n)]
+
+    uf = UnionFind(n)
+    for i in range(n):
+        ci = centers[i]
+        if not np.all(np.isfinite(ci)):
+            continue
+        for j in range(i + 1, n):
+            cj = centers[j]
+            if not np.all(np.isfinite(cj)):
+                continue
+            if float(np.linalg.norm(ci - cj)) <= max_dist:
+                uf.union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for idx in range(n):
+        root = uf.find(idx)
+        groups.setdefault(root, []).append(int(idx))
+    return [sorted(group) for _, group in sorted(groups.items(), key=lambda item: min(item[1]))]
+
 def _prune_tree_points_before_assignment(
     candidates: list[CandidateInstance],
     candidate_to_instance: np.ndarray,
@@ -646,6 +730,14 @@ def _prune_tree_points_before_assignment(
 ) -> int:
     if not candidates or not instances or candidate_to_instance.size == 0:
         return 0
+
+    num_points = 0
+    for inst in instances:
+        if inst.point_indices.size > 0:
+            num_points = max(num_points, int(np.max(inst.point_indices)) + 1)
+    for cand in candidates:
+        if cand.point_indices.size > 0:
+            num_points = max(num_points, int(np.max(cand.point_indices)) + 1)
 
     full_pole_instance_ids = {
         inst_id for inst_id, inst in enumerate(instances) if inst.class_id in FULL_POLE_CLASS_IDS
@@ -661,22 +753,14 @@ def _prune_tree_points_before_assignment(
         for inst_id, inst in enumerate(instances)
         if inst_id in sign_like_instance_ids and inst.point_indices.size > 0
     ]
-    sign_like_points = (
-        np.unique(np.concatenate(sign_like_chunks, axis=0)).astype(np.int32, copy=False)
-        if sign_like_chunks
-        else np.zeros((0,), dtype=np.int32)
-    )
+    sign_like_mask = _point_membership_mask(num_points=num_points, point_chunks=sign_like_chunks)
 
     non_tree_chunks = [
         inst.point_indices.astype(np.int32, copy=False)
         for inst in instances
         if inst.class_id not in {TREE_CLASS_ID, FENCE_CLASS_ID} and inst.point_indices.size > 0
     ]
-    non_tree_points = (
-        np.unique(np.concatenate(non_tree_chunks, axis=0)).astype(np.int32, copy=False)
-        if non_tree_chunks
-        else np.zeros((0,), dtype=np.int32)
-    )
+    non_tree_mask = _point_membership_mask(num_points=num_points, point_chunks=non_tree_chunks)
 
     tree_chunks = [
         inst.point_indices.astype(np.int32, copy=False)
@@ -688,43 +772,29 @@ def _prune_tree_points_before_assignment(
         for inst_id, inst in enumerate(instances)
         if inst_id in fence_instance_ids and inst.point_indices.size > 0
     ]
-    tree_points = (
-        np.unique(np.concatenate(tree_chunks, axis=0)).astype(np.int32, copy=False)
-        if tree_chunks
-        else np.zeros((0,), dtype=np.int32)
-    )
-    fence_points = (
-        np.unique(np.concatenate(fence_chunks, axis=0)).astype(np.int32, copy=False)
-        if fence_chunks
-        else np.zeros((0,), dtype=np.int32)
-    )
-    tree_fence_only_points = np.zeros((0,), dtype=np.int32)
-    if tree_points.size > 0 and fence_points.size > 0:
-        tree_fence_only_points = np.intersect1d(tree_points, fence_points, assume_unique=False)
-        if non_tree_points.size > 0 and tree_fence_only_points.size > 0:
-            tree_fence_only_points = tree_fence_only_points[
-                ~np.isin(tree_fence_only_points, non_tree_points, assume_unique=False)
-            ]
+    tree_mask = _point_membership_mask(num_points=num_points, point_chunks=tree_chunks)
+    fence_mask = _point_membership_mask(num_points=num_points, point_chunks=fence_chunks)
+    tree_fence_only_mask = tree_mask & fence_mask & (~non_tree_mask)
 
     removed_total = 0
-    if sign_like_points.size > 0:
+    if np.any(sign_like_mask):
         for inst_id in full_pole_instance_ids:
             inst = instances[inst_id]
-            keep_mask = ~np.isin(inst.point_indices, sign_like_points, assume_unique=False)
+            keep_mask = ~sign_like_mask[inst.point_indices.astype(np.int64, copy=False)]
             removed_total += int(inst.point_indices.size - np.count_nonzero(keep_mask))
             inst.point_indices = inst.point_indices[keep_mask].astype(np.int32, copy=False)
 
-    if non_tree_points.size > 0:
+    if np.any(non_tree_mask):
         for inst_id in tree_instance_ids:
             inst = instances[inst_id]
-            keep_mask = ~np.isin(inst.point_indices, non_tree_points, assume_unique=False)
+            keep_mask = ~non_tree_mask[inst.point_indices.astype(np.int64, copy=False)]
             removed_total += int(inst.point_indices.size - np.count_nonzero(keep_mask))
             inst.point_indices = inst.point_indices[keep_mask].astype(np.int32, copy=False)
 
-    if tree_fence_only_points.size > 0:
+    if np.any(tree_fence_only_mask):
         for inst_id in fence_instance_ids:
             inst = instances[inst_id]
-            keep_mask = ~np.isin(inst.point_indices, tree_fence_only_points, assume_unique=False)
+            keep_mask = ~tree_fence_only_mask[inst.point_indices.astype(np.int64, copy=False)]
             removed_total += int(inst.point_indices.size - np.count_nonzero(keep_mask))
             inst.point_indices = inst.point_indices[keep_mask].astype(np.int32, copy=False)
 
@@ -736,14 +806,14 @@ def _prune_tree_points_before_assignment(
         inst_id = int(candidate_to_instance[cand_idx])
         if inst_id < 0:
             continue
-        if inst_id in full_pole_instance_ids and sign_like_points.size > 0:
-            keep_mask = ~np.isin(cand.point_indices, sign_like_points, assume_unique=False)
+        if inst_id in full_pole_instance_ids and np.any(sign_like_mask):
+            keep_mask = ~sign_like_mask[cand.point_indices.astype(np.int64, copy=False)]
             cand.point_indices = cand.point_indices[keep_mask].astype(np.int32, copy=False)
-        if inst_id in tree_instance_ids and non_tree_points.size > 0:
-            keep_mask = ~np.isin(cand.point_indices, non_tree_points, assume_unique=False)
+        if inst_id in tree_instance_ids and np.any(non_tree_mask):
+            keep_mask = ~non_tree_mask[cand.point_indices.astype(np.int64, copy=False)]
             cand.point_indices = cand.point_indices[keep_mask].astype(np.int32, copy=False)
-        elif inst_id in fence_instance_ids and tree_fence_only_points.size > 0:
-            keep_mask = ~np.isin(cand.point_indices, tree_fence_only_points, assume_unique=False)
+        elif inst_id in fence_instance_ids and np.any(tree_fence_only_mask):
+            keep_mask = ~tree_fence_only_mask[cand.point_indices.astype(np.int64, copy=False)]
             cand.point_indices = cand.point_indices[keep_mask].astype(np.int32, copy=False)
 
     return removed_total
@@ -845,6 +915,9 @@ def _cluster_point_indices(
     eps: float,
     use_xy_only: bool = False,
     min_samples: int = 1,
+    downsample_threshold: int | None = None,
+    downsample_voxel_size: float | None = None,
+    debug_info: dict[str, Any] | None = None,
 ) -> list[np.ndarray]:
     point_indices = np.asarray(point_indices, dtype=np.int32).reshape(-1)
     if point_indices.size == 0:
@@ -860,7 +933,44 @@ def _cluster_point_indices(
             return [np.asarray([idx], dtype=np.int32) for idx in point_indices]
         return []
 
-    labels = DBSCAN(eps=float(eps), min_samples=min_samples).fit_predict(pts)
+    labels: np.ndarray
+    threshold = None if downsample_threshold is None else int(downsample_threshold)
+    voxel_size = None if downsample_voxel_size is None else float(downsample_voxel_size)
+    use_downsample = bool(
+        threshold is not None
+        and threshold > 0
+        and point_indices.size > threshold
+        and voxel_size is not None
+        and np.isfinite(voxel_size)
+        and voxel_size > 0.0
+    )
+    if use_downsample:
+        voxel_coords = np.floor(pts / voxel_size).astype(np.int64, copy=False)
+        unique_voxels, inverse = np.unique(voxel_coords, axis=0, return_inverse=True)
+        if unique_voxels.shape[0] == point_indices.size:
+            labels = DBSCAN(eps=float(eps), min_samples=min_samples).fit_predict(pts)
+        else:
+            if debug_info is not None:
+                debug_info["downsample_used"] = True
+                debug_info["points_before"] = int(point_indices.size)
+                debug_info["points_after"] = int(unique_voxels.shape[0])
+                debug_info["voxel_size"] = float(voxel_size)
+                debug_info["use_xy_only"] = bool(use_xy_only)
+            counts = np.bincount(inverse, minlength=unique_voxels.shape[0]).astype(np.float32, copy=False)
+            voxel_pts = np.zeros((unique_voxels.shape[0], pts.shape[1]), dtype=np.float32)
+            for dim in range(pts.shape[1]):
+                voxel_pts[:, dim] = (
+                    np.bincount(
+                        inverse,
+                        weights=pts[:, dim].astype(np.float64, copy=False),
+                        minlength=unique_voxels.shape[0],
+                    )
+                    / counts
+                ).astype(np.float32, copy=False)
+            voxel_labels = DBSCAN(eps=float(eps), min_samples=min_samples).fit_predict(voxel_pts)
+            labels = voxel_labels[inverse]
+    else:
+        labels = DBSCAN(eps=float(eps), min_samples=min_samples).fit_predict(pts)
     unique_labels = [int(label) for label in np.unique(labels) if int(label) >= 0]
     clusters = [
         np.sort(point_indices[labels == label].astype(np.int32, copy=False))
@@ -868,6 +978,46 @@ def _cluster_point_indices(
     ]
     clusters.sort(key=lambda arr: (-int(arr.size), int(arr[0]) if arr.size > 0 else -1))
     return clusters
+
+
+def _radius_prefilter_point_indices(
+    points_xyz: np.ndarray,
+    point_indices: np.ndarray,
+    *,
+    radius: float,
+    min_neighbors: int,
+) -> np.ndarray:
+    point_indices = np.unique(np.asarray(point_indices, dtype=np.int32).reshape(-1))
+    if point_indices.size == 0:
+        return point_indices
+
+    num_points = int(points_xyz.shape[0])
+    valid = (point_indices >= 0) & (point_indices < num_points)
+    point_indices = point_indices[valid].astype(np.int32, copy=False)
+    if point_indices.size == 0:
+        return point_indices
+
+    radius = float(radius)
+    min_neighbors = int(min_neighbors)
+    if (not np.isfinite(radius)) or radius <= 0.0 or min_neighbors <= 1:
+        return point_indices
+
+    coords = np.asarray(points_xyz[point_indices.astype(np.int64, copy=False)], dtype=np.float32)
+    if coords.shape[0] == 0:
+        return point_indices
+
+    tree = cKDTree(coords)
+    try:
+        counts = tree.query_ball_point(coords, r=radius, return_length=True)
+        counts_arr = np.asarray(counts, dtype=np.int32).reshape(-1)
+    except TypeError:
+        neighbor_lists = tree.query_ball_point(coords, r=radius)
+        counts_arr = np.asarray([len(neighbors) for neighbors in neighbor_lists], dtype=np.int32)
+    if counts_arr.shape[0] != point_indices.shape[0]:
+        return point_indices
+
+    keep = counts_arr >= min_neighbors
+    return point_indices[keep].astype(np.int32, copy=False)
 
 def _robust_height_range(points_xyz: np.ndarray, *, low_q: float = 0.05, high_q: float = 0.95) -> float:
     if points_xyz.size == 0:
@@ -894,7 +1044,11 @@ def _tree_ground_z_from_effective_stations(projected_dir: Path) -> float | None:
     return None
 
 
-def _tree_station_ground_refs_from_effective_stations(projected_dir: Path) -> tuple[np.ndarray, np.ndarray] | None:
+def _tree_station_ground_refs_from_effective_stations(
+    projected_dir: Path,
+    *,
+    origin_xy: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Build per-station XY + ground-z references from effective_stations.json.
     Each station ref is aggregated (median) from all valid camera extrinsics in that station.
@@ -933,6 +1087,8 @@ def _tree_station_ground_refs_from_effective_stations(projected_dir: Path) -> tu
         return None
 
     station_xy = np.stack(xy_list, axis=0).astype(np.float32, copy=False)
+    if origin_xy is not None and station_xy.shape[0] > 0:
+        station_xy = to_local_xy(station_xy, origin_xy).astype(np.float32, copy=False)
     station_ground_z = np.asarray(gz_list, dtype=np.float32).reshape(-1)
     return station_xy, station_ground_z
 
@@ -1084,6 +1240,8 @@ def _refine_instances_with_ground_and_fence(
     fence_min_cluster_points: int,
     fence_min_height: float,
     fence_dbscan_min_samples: int = 1,
+    fence_downsample_voxel: float = 0.05,
+    dbscan_downsample_threshold: int | None = None,
     fence_csf_cloth_resolution: float = 1.0,
     fence_csf_rigidness: int = 1,
     fence_csf_time_step: float = 0.65,
@@ -1144,6 +1302,7 @@ def _refine_instances_with_ground_and_fence(
     fence_csf_instances_unavailable = 0
     fence_csf_all_ground_instances = 0
     fence_csf_removed_points_total = 0
+    fence_cluster_debug: dict[str, Any] = {}
     fence_effective_ground_mask = np.zeros((points_xyz.shape[0],), dtype=bool)
     fence_global_ground_mask = _csf_ground_mask(
         points_xyz,
@@ -1200,6 +1359,9 @@ def _refine_instances_with_ground_and_fence(
             eps=float(fence_recluster_eps),
             use_xy_only=True,
             min_samples=max(1, int(fence_dbscan_min_samples)),
+            downsample_threshold=dbscan_downsample_threshold,
+            downsample_voxel_size=fence_downsample_voxel,
+            debug_info=fence_cluster_debug,
         )
         min_fence_points = max(1, int(fence_min_cluster_points))
         size_kept_clusters = [cluster for cluster in fence_clusters if int(cluster.size) >= min_fence_points]
@@ -1250,6 +1412,8 @@ def _refine_instances_with_ground_and_fence(
         "fence_global_ground_points_total": int(np.count_nonzero(fence_global_ground_mask)) if fence_global_ground_mask is not None else 0,
         "fence_effective_ground_points_total": int(np.count_nonzero(fence_effective_ground_mask)),
         "fence_csf_low_band_ratio": float(fence_csf_low_band_ratio),
+        "fence_downsample_points_before": int(fence_cluster_debug.get("points_before", 0)),
+        "fence_downsample_points_after": int(fence_cluster_debug.get("points_after", 0)),
     }
     if return_fence_global_ground_mask:
         return refined_instances, refined_point_instance_id, stats, fence_global_ground_mask
@@ -1324,6 +1488,9 @@ def largest_cluster_mask(
     min_points: int,
     *,
     dbscan_min_samples: int = 1,
+    downsample_threshold: int | None = None,
+    downsample_voxel_size: float | None = None,
+    debug_info: dict[str, Any] | None = None,
 ) -> np.ndarray:
     n = int(points_xyz.shape[0])
     if n == 0:
@@ -1336,6 +1503,9 @@ def largest_cluster_mask(
         eps=float(eps),
         use_xy_only=False,
         min_samples=dbscan_min_samples,
+        downsample_threshold=downsample_threshold,
+        downsample_voxel_size=downsample_voxel_size,
+        debug_info=debug_info,
     )
     keep_mask = np.zeros((n,), dtype=bool)
     if not clusters:
@@ -1354,9 +1524,12 @@ def denoise_assignments(
     eps: float,
     min_points: int,
     dbscan_min_samples: int,
+    downsample_threshold: int | None = None,
+    downsample_voxel_size: float | None = None,
     skip_instance_ids: np.ndarray | list[int] | set[int] | None = None,
 ) -> dict[str, Any]:
     denoise_logs: list[dict[str, int]] = []
+    downsample_logs: list[dict[str, int | float]] = []
     removed_total = 0
     skip_ids: set[int] = set()
     if skip_instance_ids is not None:
@@ -1369,12 +1542,25 @@ def denoise_assignments(
         if inst_id in skip_ids:
             denoise_logs.append({"instance_id": int(inst_id), "before": int(point_idx.size), "removed": 0})
             continue
+        cluster_debug: dict[str, Any] = {}
         keep_mask = largest_cluster_mask(
             points_xyz[point_idx],
             eps=eps,
             min_points=min_points,
             dbscan_min_samples=dbscan_min_samples,
+            downsample_threshold=downsample_threshold,
+            downsample_voxel_size=downsample_voxel_size,
+            debug_info=cluster_debug,
         )
+        if cluster_debug.get("downsample_used", False):
+            downsample_logs.append(
+                {
+                    "instance_id": int(inst_id),
+                    "points_before": int(cluster_debug.get("points_before", int(point_idx.size))),
+                    "points_after": int(cluster_debug.get("points_after", int(point_idx.size))),
+                    "voxel_size": float(cluster_debug.get("voxel_size", float(downsample_voxel_size or 0.0))),
+                }
+            )
         if keep_mask.all():
             denoise_logs.append({"instance_id": int(inst_id), "before": int(point_idx.size), "removed": 0})
             continue
@@ -1386,7 +1572,11 @@ def denoise_assignments(
         removed_total += removed
         denoise_logs.append({"instance_id": int(inst_id), "before": int(point_idx.size), "removed": removed})
 
-    return {"removed_points_total": removed_total, "instance_logs": denoise_logs}
+    return {
+        "removed_points_total": removed_total,
+        "instance_logs": denoise_logs,
+        "downsample_logs": downsample_logs,
+    }
 
 def rebuild_instances(
     instances: list[SceneInstance],
@@ -1622,25 +1812,42 @@ def build_pole_groups(
     eps: float = 0.3,
     min_samples: int = 10,
     min_cluster_points: int = 0,
-) -> tuple[list[dict[str, Any]], np.ndarray]:
+    prefilter_radius: float = 0.0,
+    prefilter_min_neighbors: int = 0,
+    return_prefilter_points: bool = False,
+    dbscan_downsample_threshold: int | None = None,
+    downsample_voxel_size: float | None = None,
+    log_prefix: str | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray] | tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
     """
     Build merged pole groups from point-level 3D clustering of class 1..6 points.
 
     Returns:
       pole_groups: list of dicts with merged metadata
       point_pole_group_id: (N,) int32, -1 for non-pole-group points
+      pole_prefilter_points: (K,) int32, pole candidate points kept by radius prefilter before DBSCAN
+        (only returned when return_prefilter_points=True)
     """
     num_points = int(points_xyz.shape[0])
     point_pole_group_id = np.full((num_points,), -1, dtype=np.int32)
 
+    def _log(message: str) -> None:
+        if log_prefix:
+            print(f"{log_prefix} {message}")
+
     source_entries: list[dict[str, Any]] = []
     source_chunks: list[np.ndarray] = []
     pole_class_ids = FULL_POLE_CLASS_IDS | SIGN_LIKE_CLASS_IDS
+    candidate_instance_count = 0
+    prefilter_kept_instance_count = 0
+    max_instance_points = 0
+    max_prefilter_points = 0
 
     for inst_id, inst in enumerate(instances):
         class_id = int(inst.class_id)
         if class_id not in pole_class_ids:
             continue
+        candidate_instance_count += 1
         pts = np.unique(np.asarray(inst.point_indices, dtype=np.int32).reshape(-1))
         if pts.size == 0:
             continue
@@ -1648,71 +1855,160 @@ def build_pole_groups(
         pts = pts[valid].astype(np.int32, copy=False)
         if pts.size == 0:
             continue
+        max_instance_points = max(max_instance_points, int(pts.size))
+        cluster_pts = _radius_prefilter_point_indices(
+            points_xyz,
+            pts,
+            radius=float(prefilter_radius),
+            min_neighbors=int(prefilter_min_neighbors),
+        )
+        if cluster_pts.size == 0:
+            continue
+        prefilter_kept_instance_count += 1
+        max_prefilter_points = max(max_prefilter_points, int(cluster_pts.size))
         source_entries.append(
             {
                 "instance_id": int(inst_id),
                 "class_id": int(class_id),
                 "point_indices": pts,
+                "cluster_point_indices": cluster_pts,
+                "xy_center": points_xyz[pts.astype(np.int64, copy=False), :2].mean(axis=0).astype(np.float32, copy=False),
             }
         )
-        source_chunks.append(pts)
+        source_chunks.append(cluster_pts)
+
+    _log(
+        "pole stage: "
+        f"candidate_instances={candidate_instance_count} "
+        f"prefilter_kept_instances={prefilter_kept_instance_count} "
+        f"max_instance_points={max_instance_points} "
+        f"max_prefilter_points={max_prefilter_points}"
+    )
 
     if not source_chunks:
+        if return_prefilter_points:
+            return [], point_pole_group_id, np.zeros((0,), dtype=np.int32)
         return [], point_pole_group_id
 
     pole_points = np.unique(np.concatenate(source_chunks, axis=0)).astype(np.int32, copy=False)
-    clusters = _cluster_point_indices(
-        points_xyz,
-        pole_points,
-        eps=float(eps),
-        use_xy_only=False,
-        min_samples=max(1, int(min_samples)),
+    source_centers = np.stack(
+        [np.asarray(entry["xy_center"], dtype=np.float32).reshape(2) for entry in source_entries],
+        axis=0,
     )
+    source_groups = _group_tree_instance_indices_by_xy_distance(source_centers, max_distance=5.0)
     min_cluster_points = max(0, int(min_cluster_points))
+    max_group_points = 0
+    max_group_entries = 0
+    group_point_counts: list[int] = []
+    for group_entry_indices in source_groups:
+        group_entries = [source_entries[idx] for idx in group_entry_indices]
+        group_chunks = [
+            np.asarray(entry["cluster_point_indices"], dtype=np.int32).reshape(-1)
+            for entry in group_entries
+            if np.asarray(entry["cluster_point_indices"]).size > 0
+        ]
+        if not group_chunks:
+            group_point_counts.append(0)
+            continue
+        group_points = np.unique(np.concatenate(group_chunks, axis=0)).astype(np.int32, copy=False)
+        group_size = int(group_points.size)
+        group_point_counts.append(group_size)
+        max_group_points = max(max_group_points, group_size)
+        max_group_entries = max(max_group_entries, len(group_entries))
+
+    _log(
+        "pole grouping: "
+        f"prefilter_points={int(pole_points.size)} "
+        f"groups={len(source_groups)} "
+        f"max_group_entries={max_group_entries} "
+        f"max_group_points={max_group_points}"
+    )
 
     pole_groups: list[dict[str, Any]] = []
-    for cluster in clusters:
-        cluster_points = np.unique(np.asarray(cluster, dtype=np.int32).reshape(-1))
-        if min_cluster_points > 0 and int(cluster_points.size) < min_cluster_points:
+    for group_idx, group_entry_indices in enumerate(source_groups):
+        group_entries = [source_entries[idx] for idx in group_entry_indices]
+        group_chunks = [
+            np.asarray(entry["cluster_point_indices"], dtype=np.int32).reshape(-1)
+            for entry in group_entries
+            if np.asarray(entry["cluster_point_indices"]).size > 0
+        ]
+        if not group_chunks:
             continue
-        if cluster_points.size == 0:
+        group_points = np.unique(np.concatenate(group_chunks, axis=0)).astype(np.int32, copy=False)
+        if group_points.size == 0:
             continue
-        valid = (cluster_points >= 0) & (cluster_points < num_points)
-        cluster_points = cluster_points[valid].astype(np.int32, copy=False)
-        if cluster_points.size == 0:
-            continue
-
-        member_instance_ids: list[int] = []
-        candidate_class_ids: set[int] = set()
-        for entry in source_entries:
-            if np.intersect1d(cluster_points, entry["point_indices"], assume_unique=False).size == 0:
-                continue
-            member_instance_ids.append(int(entry["instance_id"]))
-            candidate_class_ids.add(int(entry["class_id"]))
-
-        if not member_instance_ids:
-            continue
-
-        pole_id = len(pole_groups)
-        point_pole_group_id[cluster_points.astype(np.int64, copy=False)] = int(pole_id)
-
-        candidate_ids_sorted = np.asarray(sorted(candidate_class_ids), dtype=np.int32)
-        candidate_names = np.asarray(
-            [CLASS_ID_TO_NAME.get(int(cid), "") for cid in candidate_ids_sorted],
-            dtype="<U16",
+        _log(
+            "pole dbscan group: "
+            f"{group_idx + 1}/{len(source_groups)} "
+            f"member_instances={len(group_entries)} "
+            f"points={int(group_points.size)}"
         )
-        group: dict[str, Any] = {
-            "pole_id": int(pole_id),
-            "point_indices": cluster_points.astype(np.int32, copy=False),
-            "member_instance_ids": np.asarray(sorted(set(member_instance_ids)), dtype=np.int32),
-            "candidate_class_ids": candidate_ids_sorted,
-            "candidate_class_names": candidate_names,
-        }
-        for cls_id in range(1, 7):
-            group[f"has_cls_{cls_id}"] = int(cls_id in candidate_class_ids)
+        clusters = _cluster_point_indices(
+            points_xyz,
+            group_points,
+            eps=float(eps),
+            use_xy_only=False,
+            min_samples=max(1, int(min_samples)),
+            downsample_threshold=dbscan_downsample_threshold,
+            downsample_voxel_size=downsample_voxel_size,
+        )
+        cluster_sizes = [int(np.asarray(cluster).size) for cluster in clusters]
+        _log(
+            "pole dbscan result: "
+            f"group={group_idx + 1}/{len(source_groups)} "
+            f"clusters={len(clusters)} "
+            f"max_cluster_points={max(cluster_sizes) if cluster_sizes else 0}"
+        )
+        for cluster in clusters:
+            cluster_points = np.unique(np.asarray(cluster, dtype=np.int32).reshape(-1))
+            if min_cluster_points > 0 and int(cluster_points.size) < min_cluster_points:
+                continue
+            if cluster_points.size == 0:
+                continue
+            valid = (cluster_points >= 0) & (cluster_points < num_points)
+            cluster_points = cluster_points[valid].astype(np.int32, copy=False)
+            if cluster_points.size == 0:
+                continue
 
-        pole_groups.append(group)
+            member_instance_ids: list[int] = []
+            candidate_class_ids: set[int] = set()
+            for entry in group_entries:
+                if np.intersect1d(cluster_points, entry["cluster_point_indices"], assume_unique=False).size == 0:
+                    continue
+                member_instance_ids.append(int(entry["instance_id"]))
+                candidate_class_ids.add(int(entry["class_id"]))
 
+            if not member_instance_ids:
+                continue
+
+            pole_id = len(pole_groups)
+            point_pole_group_id[cluster_points.astype(np.int64, copy=False)] = int(pole_id)
+
+            candidate_ids_sorted = np.asarray(sorted(candidate_class_ids), dtype=np.int32)
+            candidate_names = np.asarray(
+                [CLASS_ID_TO_NAME.get(int(cid), "") for cid in candidate_ids_sorted],
+                dtype="<U16",
+            )
+            group: dict[str, Any] = {
+                "pole_id": int(pole_id),
+                "point_indices": cluster_points.astype(np.int32, copy=False),
+                "member_instance_ids": np.asarray(sorted(set(member_instance_ids)), dtype=np.int32),
+                "candidate_class_ids": candidate_ids_sorted,
+                "candidate_class_names": candidate_names,
+            }
+            for cls_id in range(1, 7):
+                group[f"has_cls_{cls_id}"] = int(cls_id in candidate_class_ids)
+
+            pole_groups.append(group)
+
+    _log(
+        "pole stage done: "
+        f"raw_groups={len(pole_groups)} "
+        f"point_pole_group_assigned={int(np.count_nonzero(point_pole_group_id >= 0))}"
+    )
+
+    if return_prefilter_points:
+        return pole_groups, point_pole_group_id, pole_points
     return pole_groups, point_pole_group_id
 
 
@@ -1790,6 +2086,99 @@ def write_pole_groups_las(
             las_out.pole_group_id = group_ids.astype(np.int32, copy=False)
             for cls_id in range(1, 7):
                 setattr(las_out, f"has_cls_{cls_id}", point_has_cls[cls_id][selected])
+
+    las_out.write(output_path)
+    return int(selected.size)
+
+
+def write_pole_anchors_las(
+    output_path: Path,
+    las_in: laspy.LasData,
+    points_xyz: np.ndarray,
+    *,
+    pole_anchors: list[dict[str, Any]],
+    random_seed: int,
+) -> int:
+    """
+    Write accepted pole-anchor point clusters.
+
+    Output includes the height-band points that formed each accepted anchor,
+    colored by pole_anchor_id. The fitted anchor center/radius/residual are
+    stored as per-point extra dimensions for inspection.
+    """
+    num_points = int(points_xyz.shape[0])
+    point_anchor_id = np.full((num_points,), -1, dtype=np.int32)
+    point_source_group_id = np.full((num_points,), -1, dtype=np.int32)
+    point_radius = np.full((num_points,), np.nan, dtype=np.float32)
+    point_residual = np.full((num_points,), np.nan, dtype=np.float32)
+    point_center_x = np.full((num_points,), np.nan, dtype=np.float32)
+    point_center_y = np.full((num_points,), np.nan, dtype=np.float32)
+
+    for anchor_id, anchor in enumerate(pole_anchors):
+        pts = np.unique(
+            np.asarray(anchor.get("point_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        )
+        if pts.size == 0:
+            continue
+        valid = (pts >= 0) & (pts < num_points)
+        pts = pts[valid].astype(np.int32, copy=False)
+        if pts.size == 0:
+            continue
+
+        pts_i64 = pts.astype(np.int64, copy=False)
+        point_anchor_id[pts_i64] = int(anchor_id)
+        point_source_group_id[pts_i64] = int(anchor.get("source_pole_group_id", anchor.get("pole_id", -1)))
+        point_radius[pts_i64] = np.float32(float(anchor.get("radius", np.nan)))
+        point_residual[pts_i64] = np.float32(float(anchor.get("residual", np.nan)))
+
+        center_xy = np.asarray(anchor.get("center_xy", np.asarray([np.nan, np.nan], dtype=np.float32)), dtype=np.float32).reshape(-1)
+        if center_xy.size >= 2:
+            point_center_x[pts_i64] = np.float32(center_xy[0])
+            point_center_y[pts_i64] = np.float32(center_xy[1])
+
+    selected = np.where(point_anchor_id >= 0)[0].astype(np.int32, copy=False)
+    header = laspy.LasHeader(point_format=3, version="1.2")
+    header.scales = np.array(las_in.header.scales, copy=True)
+    header.offsets = np.array(las_in.header.offsets, copy=True)
+    las_out = laspy.LasData(header)
+
+    extra_bytes_params = getattr(laspy, "ExtraBytesParams", None)
+    add_extra_dim = getattr(las_out, "add_extra_dim", None)
+    if extra_bytes_params is not None and callable(add_extra_dim):
+        las_out.add_extra_dim(extra_bytes_params(name="cls_id", type=np.uint8))
+        las_out.add_extra_dim(extra_bytes_params(name="pole_anchor_id", type=np.int32))
+        las_out.add_extra_dim(extra_bytes_params(name="source_pole_group_id", type=np.int32))
+        las_out.add_extra_dim(extra_bytes_params(name="anchor_radius", type=np.float32))
+        las_out.add_extra_dim(extra_bytes_params(name="anchor_residual", type=np.float32))
+        las_out.add_extra_dim(extra_bytes_params(name="anchor_center_x", type=np.float32))
+        las_out.add_extra_dim(extra_bytes_params(name="anchor_center_y", type=np.float32))
+
+    if selected.size > 0:
+        xyz = points_xyz[selected]
+        las_out.x = xyz[:, 0]
+        las_out.y = xyz[:, 1]
+        las_out.z = xyz[:, 2]
+
+        anchor_ids = point_anchor_id[selected]
+        num_anchors = int(anchor_ids.max()) + 1
+        color_table = _instance_colors(num_anchors, seed=int(random_seed) + 1543)
+        rgb8 = color_table[anchor_ids]
+        rgb16 = rgb8.astype(np.uint16) * 256
+        las_out.red = rgb16[:, 0]
+        las_out.green = rgb16[:, 1]
+        las_out.blue = rgb16[:, 2]
+
+        cls = np.full((selected.size,), 1, dtype=np.uint8)
+        las_out.classification = cls
+
+        if extra_bytes_params is not None and callable(add_extra_dim):
+            las_out.cls_id = cls
+            las_out.pole_anchor_id = anchor_ids.astype(np.int32, copy=False)
+            las_out.source_pole_group_id = point_source_group_id[selected].astype(np.int32, copy=False)
+            las_out.anchor_radius = point_radius[selected]
+            las_out.anchor_residual = point_residual[selected]
+            las_out.anchor_center_x = point_center_x[selected]
+            las_out.anchor_center_y = point_center_y[selected]
 
     las_out.write(output_path)
     return int(selected.size)
@@ -2122,6 +2511,7 @@ def _refine_tree_instances(
     points_xyz: np.ndarray,
     instances: list[SceneInstance],
     *,
+    log_prefix: str | None = None,
     tree_ground_z: float | None,
     tree_station_xy: np.ndarray | None = None,
     tree_station_ground_z: np.ndarray | None = None,
@@ -2129,6 +2519,8 @@ def _refine_tree_instances(
     trunk_band_max: float,
     trunk_dbscan_eps: float,
     trunk_dbscan_min_samples: int,
+    trunk_downsample_voxel: float = 0.05,
+    dbscan_downsample_threshold: int | None = None,
     trunk_min_points: int,
     trunk_min_height: float,
     trunk_max_radius: float,
@@ -2138,8 +2530,14 @@ def _refine_tree_instances(
     trunk_height_band_min: float | None = None,
     trunk_height_band_max: float | None = None,
     tree_final_denoise_eps: float = 0.50,
+    tree_final_downsample_voxel: float = 0.10,
+    tree_final_downsample_threshold: int | None = None,
     return_trunk_stage_clusters: bool = False,
 ) -> tuple[list[SceneInstance], np.ndarray, dict[str, int]] | tuple[list[SceneInstance], np.ndarray, dict[str, int], dict[str, list[dict[str, Any]]]]:
+    def _log(message: str) -> None:
+        if log_prefix:
+            print(f"{log_prefix} {message}")
+
     copied_instances = [_copy_scene_instance(inst) for inst in instances]
     empty_stats = {
         'tree_instances_before': 0,
@@ -2152,6 +2550,10 @@ def _refine_tree_instances(
         'pending_crowns_dropped': 0,
         'tree_final_denoise_removed_points': 0,
         'tree_final_denoise_touched_instances': 0,
+        'trunk_downsample_points_before': 0,
+        'trunk_downsample_points_after': 0,
+        'tree_final_downsample_points_before': 0,
+        'tree_final_downsample_points_after': 0,
     }
     empty_stage = {'height': [], 'radius': [], 'verticality': []}
     if not copied_instances:
@@ -2219,6 +2621,9 @@ def _refine_tree_instances(
                 'point_indices': point_indices,
                 'radius_band_points': radius_band_points,
                 'height_band_points': height_band_points,
+                'xy_center': points_xyz[point_indices, :2].mean(axis=0).astype(np.float32, copy=False)
+                if point_indices.size > 0
+                else np.asarray([np.nan, np.nan], dtype=np.float32),
             }
         )
 
@@ -2234,6 +2639,10 @@ def _refine_tree_instances(
         return final_instances, final_point_instance_id, stats
 
     band_chunks = [info['radius_band_points'] for info in tree_infos if info['radius_band_points'].size > 0]
+    _log(
+        f"tree refine stage: tree_instances={int(tree_instances_before)} "
+        f"radius_band_nonempty={int(len(band_chunks))}"
+    )
     if not band_chunks:
         final_instances = non_tree_instances
         stats = dict(empty_stats)
@@ -2246,7 +2655,6 @@ def _refine_tree_instances(
             return final_instances, final_point_instance_id, stats, empty_stage
         return final_instances, final_point_instance_id, stats
 
-    all_band_points = np.unique(np.concatenate(band_chunks, axis=0)).astype(np.int32, copy=False)
     # Map each radius-band point to its source tree instance so height补点 can be limited
     # to the tree instances that actually contribute to the merged trunk candidate cluster.
     radius_point_to_tree_info: dict[int, int] = {}
@@ -2255,21 +2663,75 @@ def _refine_tree_instances(
         for point_idx in radius_points.astype(np.int64, copy=False):
             radius_point_to_tree_info[int(point_idx)] = int(info_idx)
     height_link_radius = 0.05
-
-    candidate_clusters = _cluster_point_indices(
-        points_xyz,
-        all_band_points,
-        eps=float(trunk_dbscan_eps),
-        use_xy_only=True,
-        min_samples=int(trunk_dbscan_min_samples),
+    group_centers = np.stack(
+        [np.asarray(info['xy_center'], dtype=np.float32).reshape(2) for info in tree_infos],
+        axis=0,
     )
-    trunk_candidate_groups = len(candidate_clusters)
+    tree_info_groups = _group_tree_instance_indices_by_xy_distance(group_centers, max_distance=10.0)
+    group_band_sizes = [
+        int(
+            np.unique(
+                np.concatenate(
+                    [
+                        np.asarray(tree_infos[info_idx]['radius_band_points'], dtype=np.int32).reshape(-1)
+                        for info_idx in group_info_indices
+                        if np.asarray(tree_infos[info_idx]['radius_band_points']).size > 0
+                    ],
+                    axis=0,
+                )
+            ).size
+        )
+        for group_info_indices in tree_info_groups
+        if any(np.asarray(tree_infos[info_idx]['radius_band_points']).size > 0 for info_idx in group_info_indices)
+    ]
+    _log(
+        f"tree trunk grouping: groups={int(len(tree_info_groups))} "
+        f"max_group_radius_band_points={int(max(group_band_sizes) if group_band_sizes else 0)}"
+    )
+
+    candidate_clusters: list[np.ndarray] = []
+    trunk_candidate_groups = 0
+    trunk_downsample_points_before = 0
+    trunk_downsample_points_after = 0
+    for group_info_indices in tree_info_groups:
+        group_band_chunks = [
+            np.asarray(tree_infos[info_idx]['radius_band_points'], dtype=np.int32).reshape(-1)
+            for info_idx in group_info_indices
+            if np.asarray(tree_infos[info_idx]['radius_band_points']).size > 0
+        ]
+        if not group_band_chunks:
+            continue
+        group_band_points = np.unique(np.concatenate(group_band_chunks, axis=0)).astype(np.int32, copy=False)
+        if group_band_points.size == 0:
+            continue
+        group_cluster_debug: dict[str, Any] = {}
+        group_clusters = _cluster_point_indices(
+            points_xyz,
+            group_band_points,
+            eps=float(trunk_dbscan_eps),
+            use_xy_only=True,
+            min_samples=int(trunk_dbscan_min_samples),
+            downsample_threshold=dbscan_downsample_threshold,
+            downsample_voxel_size=trunk_downsample_voxel,
+            debug_info=group_cluster_debug,
+        )
+        candidate_clusters.extend(group_clusters)
+        trunk_candidate_groups += int(len(group_clusters))
+        if group_cluster_debug.get('downsample_used', False):
+            trunk_downsample_points_before += int(group_cluster_debug.get('points_before', 0))
+            trunk_downsample_points_after += int(group_cluster_debug.get('points_after', 0))
+    candidate_cluster_sizes = [int(cluster.size) for cluster in candidate_clusters]
+    _log(
+        f"tree trunk dbscan: candidate_groups={int(trunk_candidate_groups)} "
+        f"max_candidate_cluster_points={int(max(candidate_cluster_sizes) if candidate_cluster_sizes else 0)}"
+    )
 
     # kept for CLI compatibility; verticality threshold is not applied right now
     _ = trunk_min_verticality
 
     min_trunk_points = max(1, int(trunk_min_points))
     metrics_all: list[dict[str, Any]] = []
+    max_local_height_points = 0
     for cluster in candidate_clusters:
         if cluster.size < min_trunk_points:
             continue
@@ -2291,6 +2753,7 @@ def _refine_tree_instances(
             if local_height_chunks:
                 local_height_points = np.unique(np.concatenate(local_height_chunks, axis=0)).astype(np.int32, copy=False)
                 if local_height_points.size > 0:
+                    max_local_height_points = max(max_local_height_points, int(local_height_points.size))
                     local_height_tree = cKDTree(points_xyz[local_height_points, :2])
                     neighbor_lists = local_height_tree.query_ball_point(cluster_xyz[:, :2], r=height_link_radius)
                     matched_lists = [np.asarray(neighbors, dtype=np.int32) for neighbors in neighbor_lists if len(neighbors) > 0]
@@ -2319,6 +2782,10 @@ def _refine_tree_instances(
                 'verticality': float(verticality),
             }
         )
+    _log(
+        f"tree height-band attach prep: metrics_all={int(len(metrics_all))} "
+        f"max_local_height_points={int(max_local_height_points)}"
+    )
 
     height_clusters = [m for m in metrics_all if m['robust_height'] > float(trunk_min_height)]
     radius_clusters = [
@@ -2338,6 +2805,10 @@ def _refine_tree_instances(
     }
 
     anchors = vertical_clusters
+    _log(
+        f"tree anchor filter: height_pass={int(len(height_clusters))} "
+        f"radius_pass={int(len(radius_clusters))} anchors={int(len(anchors))}"
+    )
     point_to_anchor: dict[int, int] = {}
     for anchor_id, anchor in enumerate(anchors):
         for point_idx in anchor['point_indices'].astype(np.int64, copy=False):
@@ -2410,6 +2881,10 @@ def _refine_tree_instances(
             pending_attached += 1
         else:
             pending_dropped += 1
+    _log(
+        f"tree crown attach: pending={int(pending_before_attach)} "
+        f"attached={int(pending_attached)} dropped={int(pending_dropped)}"
+    )
 
     tree_instances_out: list[SceneInstance] = []
     for anchor_id, point_chunks in enumerate(anchor_point_chunks):
@@ -2437,18 +2912,32 @@ def _refine_tree_instances(
     tree_final_denoise_removed_points = 0
     tree_final_denoise_touched_instances = 0
     tree_final_eps = float(tree_final_denoise_eps)
+    tree_final_downsample_points_before = 0
+    tree_final_downsample_points_after = 0
+    pre_final_sizes = [int(np.unique(np.asarray(inst.point_indices, dtype=np.int32)).size) for inst in tree_instances_out]
+    _log(
+        f"tree final denoise prep: trees={int(len(tree_instances_out))} "
+        f"max_tree_points={int(max(pre_final_sizes) if pre_final_sizes else 0)}"
+    )
     for inst in tree_instances_out:
         point_indices = np.unique(np.asarray(inst.point_indices, dtype=np.int32))
         if point_indices.size == 0:
             continue
         if tree_final_eps > 0:
+            final_cluster_debug: dict[str, Any] = {}
             clusters = _cluster_point_indices(
                 points_xyz,
                 point_indices,
                 eps=tree_final_eps,
                 use_xy_only=False,
                 min_samples=1,
+                downsample_threshold=tree_final_downsample_threshold,
+                downsample_voxel_size=tree_final_downsample_voxel,
+                debug_info=final_cluster_debug,
             )
+            if final_cluster_debug.get('downsample_used', False):
+                tree_final_downsample_points_before += int(final_cluster_debug.get('points_before', 0))
+                tree_final_downsample_points_after += int(final_cluster_debug.get('points_after', 0))
             keep_points = clusters[0] if clusters else point_indices
         else:
             keep_points = point_indices
@@ -2482,6 +2971,10 @@ def _refine_tree_instances(
         'pending_crowns_dropped': int(pending_dropped),
         'tree_final_denoise_removed_points': int(tree_final_denoise_removed_points),
         'tree_final_denoise_touched_instances': int(tree_final_denoise_touched_instances),
+        'trunk_downsample_points_before': int(trunk_downsample_points_before),
+        'trunk_downsample_points_after': int(trunk_downsample_points_after),
+        'tree_final_downsample_points_before': int(tree_final_downsample_points_before),
+        'tree_final_downsample_points_after': int(tree_final_downsample_points_after),
     }
 
     if return_trunk_stage_clusters:
