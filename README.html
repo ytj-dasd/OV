@@ -358,9 +358,19 @@
 
           <h3>论文贡献</h3>
           <ol>
-            <li><strong>提出基于图像知识的彩色点云 Open-Vocabulary 道路设施提取方法。</strong>结合 2D 开放词汇图像分割结果和彩色点云空间结构，实现道路设施实例提取与属性估计。</li>
+            <li><strong>提出基于图像知识的彩色点云 Open-Vocabulary 道路设施提取方法。</strong>结合 2D 开放词汇图像分割结果和彩色点云空间结构，实现道路设施实例提取与属性估计。方法不依赖与点云严格同步或完美配准的真实 2D 图像，因此适用于仅有点云、缺少对应图像或图像存储成本较高的道路场景数据。</li>
             <li><strong>构建并发布 RS30 自采道路设施数据集。</strong>数据覆盖蔡家浜路、财聚路、荣欣路三个真实道路场景，包含俯视道路要素和正视道路设施要素。</li>
           </ol>
+          <div class="callout">
+            <p><strong>方法设计动机：</strong></p>
+            <ul>
+              <li>LiDAR 点云经常缺少严格对应的 2D 图像，例如 Semantic3D、Toronto3D、Paris-CARLA-3D。</li>
+              <li>Photogrammetry 点云很多时候没有可直接使用的深度图，例如 Campus3D、STPLS3D、SensatUrban。</li>
+              <li>Simulation 或 CAD 模型转点云时可能没有配套真实 2D 图像，例如 SynthCity。</li>
+              <li>多传感器配准后的融合点云模型难以找到完美对应的 2D 图像。</li>
+              <li>2D 图像存储和处理成本较高。例如在 ScanNetv2 中，一个 3D 点云或 mesh 可能只有数 MB，但对应 RGB-D 图像可能达到 GB 级。</li>
+            </ul>
+          </div>
         </section>
 
         <section id="dataset">
@@ -411,6 +421,16 @@
         <section id="experiments">
           <h2>实验设计</h2>
 
+          <h3>实验目的</h3>
+          <ul>
+            <li>与现有 2D Open-Vocabulary 方法相比，验证本文方法是否能获得更稳定的 3D 道路设施实例。</li>
+            <li>与现有 3D Open-Vocabulary 方法相比，验证本文方法是否更适合道路场景中的细粒度设施提取。</li>
+            <li>将 ISBNet、SPFormer 作为纯点云闭集监督实例分割基线，验证纯点云实例分割是否依赖训练场景。</li>
+            <li>分析纯点云实例分割模型迁移到新道路场景后性能下降的程度。</li>
+            <li>验证图像知识驱动方法是否具有更好的跨场景泛化性。</li>
+            <li>验证 Open-Vocabulary 方法在新增类别时是否比闭集点云模型更灵活。</li>
+          </ul>
+
           <h3>Open-Vocabulary 方法对比</h3>
           <div class="grid">
             <div class="panel">
@@ -444,6 +464,20 @@
             <li><strong>树木后处理：</strong>验证对行道树树冠、树干和相邻树木实例分离的改善效果。</li>
           </ul>
           <p>建议设置基线方法、单模块消融和完整方法三类实验配置。</p>
+
+          <h3>定性实验分析</h3>
+          <div class="panel">
+            <h4>提示词敏感性与 Pipeline 稳定性</h4>
+            <p>该实验的目的不是证明某个 prompt 最优，而是说明 Open-Vocabulary 方法对文本提示存在敏感性，并分析本文 pipeline 如何通过 3D 融合和实例后处理缓解部分不稳定结果。</p>
+            <p>建议选择电线杆、路灯杆、交通标志、行道树、围栏等典型类别，展示以下提示词设置下的分割结果：</p>
+            <ul>
+              <li>中文类别名与英文类别名。</li>
+              <li>粗粒度 prompt 与细粒度 prompt。</li>
+              <li>单类别 prompt 与多类别 prompt。</li>
+              <li>同义词或近义词 prompt。</li>
+            </ul>
+            <p>结果展示以图片对比为主，可放在定性分析或讨论部分，用于解释不同提示词下的漏检、误检和实例粘连现象。</p>
+          </div>
         </section>
 
         <section id="evaluation">
@@ -484,6 +518,7 @@
             <li>完成 OpenIns3D 推理实验。</li>
             <li>完成 ISBNet、SPFormer 跨场景泛化实验。</li>
             <li>设计并运行双通道合并、杆状物后处理、树木后处理消融实验。</li>
+            <li>补充提示词敏感性与 pipeline 稳定性定性分析。</li>
             <li>确定人工统计与实例分割真值标注的评估范围。</li>
           </ul>
         </section>
