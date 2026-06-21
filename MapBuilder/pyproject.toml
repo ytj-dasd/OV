@@ -1,0 +1,51 @@
+[project]
+name = "landmark"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "laspy[lazrs]>=2.7.0",
+    "numpy>=2.4.2",
+    "opencv-python>=4.13.0.92",
+    "cloth-simulation-filter>=1.1",
+    "pillow>=12.1.0",
+    "plyfile>=1.1.3",
+    "pyshp>=3.0.3",
+    "pytest>=9.0.2",
+    "rasterio>=1.5.0",
+    "scipy>=1.17.1",
+    "scikit-image>=0.25.0",
+    "shapely>=2.1.2",
+]
+
+[project.scripts]
+landmark-main = "landmark.apps.main:main"
+landmark-full = "landmark.apps.full:main"
+landmark-road-arrow = "landmark.apps.road_arrow:main"
+landmark-laneline = "landmark.apps.laneline:main"
+landmark-crosswalk = "landmark.apps.crosswalk:main"
+landmark-sidewalk = "landmark.apps.sidewalk:main"
+landmark-sidewalk-v2 = "landmark.apps.sidewalk_v2:main"
+landmark-belt = "landmark.apps.belt:main"
+landmark-belt-v2 = "landmark.apps.belt_v2:main"
+landmark-sidewalk-1 = "landmark.apps.sidewalk_1:main"
+landmark-sidewalk-2 = "landmark.apps.sidewalk_2:main"
+landmark-sidewalk-3 = "landmark.apps.sidewalk_3:main"
+landmark-sidewalk-mask-debug = "landmark.apps.sidewalk_mask_debug:main"
+landmark-tool-pre-part = "landmark.tools.pc_process.pre_part:main"
+landmark-tool-tiler = "landmark.tools.pc_process.tiler:main"
+landmark-part = "landmark.tools.pc_process.part.part:main"
+landmark-tile-part = "landmark.tools.pc_process.part.tile_part:main"
+landmark-scene-part = "landmark.tools.pc_process.part.scene_part:main"
+landmark-bev-part = "landmark.tools.sam3.bev_part:main"
+landmark-instance-seg-v2 = "landmark.tools.sam3.instance_seg_v2:main"
+landmark-manhole = "landmark.apps.manhole:main"
+landmark-rebuild-road-rgb-parts = "landmark.apps.rebuild_road_rgb_parts:main"
+landmark-arrow-shp = "landmark.tools.to_shp.arrow_shp:main"
+landmark-box-shp = "landmark.tools.to_shp.box_shp:main"
+landmark-wide-curve-shp = "landmark.tools.to_shp.wide_curve_shp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
